@@ -505,7 +505,7 @@ async function handleUiRequest(request, env) {
   } else if (path === '/admin' && !loggedIn) {
       return new Response(null, { status: 302, headers: { 'Location': '/' } });
   } else {
-      pageTitle = '优选IP与域名';
+      pageTitle = 'CF-DNS-Clon';
       const domainsPromise = db.prepare("SELECT source_domain, target_domain, notes, last_synced_time, is_system FROM domains WHERE is_enabled = 1 AND last_sync_status IN ('success', 'no_change') ORDER BY is_system DESC, notes").all();
       const ipSourcesPromise = db.prepare("SELECT url, github_path, last_synced_time FROM ip_sources WHERE is_enabled = 1 AND last_sync_status IN ('success', 'no_change') ORDER BY github_path").all();
       const threeNetworkSourcePromise = getSetting(db, 'THREE_NETWORK_SOURCE');
@@ -799,7 +799,7 @@ function getPublicHomepage(requestUrl, domains, ipSources, threeNetworkSourceNam
             <div class="blur-orb blur-orb-2"></div>
         </div>
         <nav class="public-nav">
-            <div class="public-nav-title">优选节点</div>
+            <div class="public-nav-title">CF-DNS-Clon</div>
             <div class="public-nav-actions">
                 ${authButton}
                 <button id="theme-toggle" aria-label="Toggle theme">
@@ -1924,3 +1924,4 @@ async function fetchThreeNetworkIps(source, log) {
         return { yd: [], dx: [], lt: [] };
     }
 }
+
