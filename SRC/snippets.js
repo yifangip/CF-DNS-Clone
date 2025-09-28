@@ -2,21 +2,24 @@ const FIXED_UUID = '';
 const SUB_ID = 'FLWgkTE';
 const EXTERNAL_SUB_BASE_URL = 'https://sub.kkii.eu.org';
 const FRONTEND_HTML_URL = 'https://appxzm.github.io/ui.html';
-const PROXY_IPS = ['hk.665966.com']; 
-const CONNECTION_TIMEOUT_MS = 8000; 
+const PROXY_IPS = ['proxyip.fxxk.dedyn.io'];
+const CONNECTION_TIMEOUT_MS = 5000;
+
 import { connect } from 'cloudflare:sockets';
+
 function connectWithTimeout(hostname, port) {
     return Promise.race([
         connect({ hostname, port }),
         new Promise((_, reject) => setTimeout(() => reject(new Error('Connection timed out')), CONNECTION_TIMEOUT_MS))
     ]);
 }
+
 async function handleAppDownloadRequest(request) {
     const url = new URL(request.url);
     const targetUrlString = url.pathname.substring(1).replace(':/', '://');
     try {
         const targetUrl = new URL(targetUrlString);
-        const allowedDomains = ['github.com', 'objects.githubusercontent.com'];
+        const allowedDomains = ['github.com', 'objects.githubusercontent.com', 'api.github.com'];
         if (!allowedDomains.some(domain => targetUrl.hostname.endsWith(domain))) {
             return new Response('不支持的加速域名', { status: 400 });
         }
@@ -42,7 +45,6 @@ export default {
             const upgradeHeader = request.headers.get('Upgrade');
             
             if (upgradeHeader?.toLowerCase() !== 'websocket') {
-                // --- XHTTP (增强功能) ---
                 if (request.method === 'POST') {
                     return handleXhttp(request);
                 }
@@ -173,7 +175,6 @@ export default {
                 return new Response(JSON.stringify(request.cf, null, 2), { status: 200, headers: { 'Content-Type': 'application/json;charset=UTF-8' } });
             }
 
-            // --- WebSocket (恢复原始逻辑) ---
             let socks5Address = '';
             let parsedSocks5Address = {};
             let enableSocks = null;
@@ -186,10 +187,6 @@ export default {
             if (urlPathLower.includes('/socks5=') || urlPathLower.includes('/s5=') || urlPathLower.includes('/gs5=')) {
                 socks5Address = url.pathname.split('5=')[1];
                 enableGlobalSocks = urlPathLower.includes('/gs5=');
-                enableSocks = 'socks5';
-            } else if (urlPathLower.includes('/http=')) {
-                socks5Address = url.pathname.split('http=')[1];
-                enableSocks = 'http';
             } else if (urlPathLower.includes('/socks://') || urlPathLower.includes('/socks5://') || urlPathLower.includes('/http://')) {
                 socks5Address = url.pathname.split('://')[1].split('#')[0];
                 if (socks5Address.includes('@')) {
@@ -200,12 +197,12 @@ export default {
                     socks5Address = `${userPassword}@${socks5Address.substring(lastAtIndex + 1)}`;
                 }
                 enableGlobalSocks = true;
-                enableSocks = urlPathLower.includes('/http://') ? 'http' : 'socks5';
             }
 
             if (socks5Address) {
                 try {
                     parsedSocks5Address = socks5AddressParser(socks5Address);
+                    enableSocks = urlPathLower.includes('http://') ? 'http' : 'socks5';
                 } catch (err) {
                     enableSocks = null;
                 }
@@ -330,7 +327,7 @@ async function handleXhttp(request) {
         try {
             remoteSocket = await connectWithTimeout(addressRemote, portRemote);
         } catch (err) {
-            let proxyConfig = getProxyConfiguration(PROXY_IPS[0], 443);
+            let proxyConfig = getProxyConfiguration('', 443);
             remoteSocket = await connectWithTimeout(proxyConfig.ip, proxyConfig.port);
         }
 
@@ -357,8 +354,6 @@ async function handleXhttp(request) {
         return new Response(`XHTTP connection failed: ${err.message}`, { status: 502 });
     }
 }
-
-// --- Helper Functions (Mostly from original, with enhancements) ---
 
 function createWebSocketReadableStream(ws, earlyDataHeader) {
     return new ReadableStream({
@@ -490,6 +485,7 @@ async function socks5Connect(addressType, addressRemote, portRemote, socks5Addre
         case 2: DSTADDR = new Uint8Array([3, addressRemote.length, ...encoder.encode(addressRemote)]); break;
         case 3: DSTADDR = new Uint8Array([4, ...addressRemote.split(':').flatMap(x => [parseInt(x.slice(0, 2), 16), parseInt(x.slice(2), 16)])]); break;
     }
+    
     await writer.write(new Uint8Array([5, 1, 0, ...DSTADDR, portRemote >> 8, portRemote & 0xff]));
     res = (await reader.read()).value;
     if (res[1] !== 0) throw new Error("SOCKS5 final connection failed");
@@ -522,8 +518,10 @@ async function handleUDPOutBound(webSocket, vlessResponseHeader, rawClientData) 
             controller.enqueue(chunk.slice(2, 2 + udpPacketLength));
         },
     });
+    
     const writer = transformStream.writable.getWriter();
     writer.write(rawClientData);
+
     transformStream.readable.pipeTo(new WritableStream({
         async write(chunk) {
             const resp = await fetch('https://1.1.1.1/dns-query', {
@@ -542,6 +540,7 @@ async function handleUDPOutBound(webSocket, vlessResponseHeader, rawClientData) 
         }
     }));
 }
+
 function getProxyConfiguration(ProxyIP, ProxyPort) {
     if (!ProxyIP || ProxyIP === '') ProxyIP = PROXY_IPS[0] || '';
     if (ProxyIP.includes(']:')) {
