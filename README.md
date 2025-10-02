@@ -7,10 +7,6 @@
     <img src="https://img.shields.io/badge/Telegram-2CA5E0?style=for-the-badge&logo=telegram&logoColor=white" alt="Telegram">
   </a>
 </div>
-
-  <p><strong>**关于 CF-DNS-Clone-Vless-Sub.js**</strong></p>
-
-
 ---
 
 ## 🚀 项目是干嘛的？
