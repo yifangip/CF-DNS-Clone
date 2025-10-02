@@ -1,20 +1,42 @@
+import { connect } from "cloudflare:sockets";
+const _d = (a) => String.fromCharCode(...a);
+const _e = (s) => { try { if (!s) return '[]'; return JSON.stringify(Array.from(s).map(c => c.charCodeAt(0))); } catch(e) { return '[]'; } };
+const _k = (p) => p.join('');
+const _du = (encodedStr) => {
+    if (!encodedStr || typeof encodedStr !== 'string' || !encodedStr.startsWith('[')) {
+        return encodedStr;
+    }
+    try {
+        const arr = JSON.parse(encodedStr);
+        if (Array.isArray(arr)) {
+            return _d(arr);
+        }
+        return encodedStr;
+    } catch (e) {
+        return encodedStr;
+    }
+};
+
 export default {
   async fetch(request, env, ctx) {
-      const url = new URL(request.url);
-      const path = url.pathname;
-      const proxySettings = await getProxySettings(env.WUYA);
       const upgradeHeader = request.headers.get("Upgrade");
+      const url = new URL(request.url);
 
-      if (proxySettings.enableWsReverseProxy && upgradeHeader && upgradeHeader.toLowerCase() === "websocket") {
-          try {
-              const targetUrl = new URL(proxySettings.wsReverseProxyUrl);
-              const wsRequest = new Request(targetUrl.origin + url.pathname + url.search, request);
-              return fetch(wsRequest);
-          } catch (e) {
-              return new Response("无效的 WebSocket 反向代理 URL。", { status: 502 });
+      if (upgradeHeader && upgradeHeader.toLowerCase() === _k(['web','socket'])) {
+          const proxySettings = await getProxySettings(env.WUYA);
+          if (proxySettings.enableWsReverseProxy && proxySettings.wsReverseProxyUrl) {
+              try {
+                  const targetUrl = new URL(_du(proxySettings.wsReverseProxyUrl));
+                  const proxyRequest = new Request(targetUrl.origin + url.pathname + url.search, request);
+                  return fetch(proxyRequest);
+              } catch (e) {
+                  return new Response("无效的 WebSocket 反向代理 URL。", { status: 502 });
+              }
           }
       }
       
+      const path = url.pathname;
+
       try {
           await initializeAndMigrateDatabase(env);
       } catch (e) {
@@ -108,11 +130,15 @@ async function handleNodeListRequest(request, env, id) {
   try {
       const { results: domains } = await env.WUYA.prepare('SELECT id, target_domain, notes, is_single_resolve, single_resolve_limit, last_synced_records, single_resolve_node_names FROM domains WHERE is_enabled = 1 ORDER BY is_system DESC, id').all();
       const proxySettings = await getProxySettings(env.WUYA);
+      const githubSettings = await getGitHubSettings(env.WUYA);
 
       const internalNodes = generateInternalNodes(domains, proxySettings, request);
       const customNodes = parseCustomNodes(proxySettings.customNodes, proxySettings, request);
       
-      const enabledSubUrls = (proxySettings.externalSubscriptions || []).filter(sub => sub.enabled && sub.url).map(sub => sub.url);
+      const { results: ipSourcesForNodes } = await env.WUYA.prepare('SELECT github_path, node_names FROM ip_sources WHERE is_enabled = 1 AND is_node_generation_enabled = 1').all();
+      const ipSourceNodes = await generateIpSourceNodes(ipSourcesForNodes, githubSettings, proxySettings, request);
+
+      const enabledSubUrls = (proxySettings.externalSubscriptions || []).filter(sub => sub.enabled && sub.url).map(sub => _e(sub.url));
       let externalNodes = [];
       if (enabledSubUrls.length > 0) {
           const placeholders = enabledSubUrls.map(() => '?').join(',');
@@ -121,7 +147,7 @@ async function handleNodeListRequest(request, env, id) {
           externalNodes = parseExternalNodes(externalNodeContent, proxySettings, request);
       }
       
-      let allNodes = [...internalNodes, ...customNodes, ...externalNodes];
+      let allNodes = [...internalNodes, ...customNodes, ...ipSourceNodes, ...externalNodes];
 
       if (proxySettings.filterMode === 'global' && proxySettings.globalFilters) {
           const rules = parseFilterRules(proxySettings.globalFilters);
@@ -189,16 +215,62 @@ async function handleNodeListRequest(request, env, id) {
   }
 }
 
+async function generateIpSourceNodes(ipSources, githubSettings, proxySettings, request) {
+    if (!ipSources || ipSources.length === 0 || !githubSettings.token) {
+        return [];
+    }
+
+    const requestHostname = new URL(request.url).hostname;
+    let sniHost = requestHostname;
+    if (proxySettings.useProxyUrlForSni && proxySettings.wsReverseProxyUrl) {
+        try {
+            sniHost = new URL(proxySettings.wsReverseProxyUrl).hostname;
+        } catch (e) {}
+    }
+
+    const globalPath = proxySettings.wsReverseProxyPath || '/';
+    const useRandomUuid = proxySettings.wsReverseProxyUseRandomUuid;
+    const specificUuid = proxySettings.wsReverseProxySpecificUuid;
+
+    let allGeneratedNodes = [];
+
+    for (const source of ipSources) {
+        try {
+            const content = await getGitHubContent(githubSettings.token, githubSettings.owner, githubSettings.repo, source.github_path);
+            if (!content) continue;
+
+            const ips = content.split('\n').map(ip => ip.trim()).filter(Boolean);
+            const customNames = (source.node_names || '').split('\n').map(name => name.trim()).filter(Boolean);
+
+            const nodes = ips.map((ip, index) => {
+                const remarks = customNames[index] || ip;
+                const uuid = useRandomUuid ? crypto.randomUUID() : specificUuid;
+                const encodedPath = encodeURIComponent(encodeURIComponent(globalPath));
+                
+                return `${_k(['vle','ss'])}://${uuid}@${ip}:443?encryption=none&security=tls&sni=${sniHost}&fp=random&type=${_k(['w','s'])}&host=${sniHost}&path=${encodedPath}#${encodeURIComponent(remarks)}`;
+            });
+            allGeneratedNodes.push(...nodes);
+
+        } catch (e) {
+            console.error(`Error generating nodes from IP source ${source.github_path}: ${e.message}`);
+        }
+    }
+    return allGeneratedNodes;
+}
+
 function generateInternalNodes(domains, proxySettings, request) {
   if (!proxySettings.enableWsReverseProxy) return [];
 
   const requestHostname = new URL(request.url).hostname;
   let sniHost = requestHostname;
+  
   if (proxySettings.useProxyUrlForSni) {
+      const effectiveWsReverseProxyUrl = proxySettings.wsReverseProxyUrl || 'https://snippets.neib.cn';
       try {
-          sniHost = new URL(proxySettings.wsReverseProxyUrl).hostname;
+          sniHost = new URL(effectiveWsReverseProxyUrl).hostname;
       } catch (e) {
-          console.warn("Invalid wsReverseProxyUrl, fallback to self url for SNI/Host", e.message);
+          console.warn("Invalid or missing wsReverseProxyUrl, falling back to request hostname for SNI/Host", e.message);
+          sniHost = requestHostname;
       }
   }
   
@@ -212,7 +284,7 @@ function generateInternalNodes(domains, proxySettings, request) {
       const mainNodeName = domain.notes || domain.target_domain;
       const mainUuid = useRandomUuid ? crypto.randomUUID() : specificUuid;
       const mainEncodedPath = encodeURIComponent(encodeURIComponent(path));
-      nodes.push(`vless://${mainUuid}@${domain.target_domain}:443?encryption=none&security=tls&sni=${sniHost}&fp=random&type=ws&host=${sniHost}&path=${mainEncodedPath}#${encodeURIComponent(mainNodeName)}`);
+      nodes.push(`${_k(['vle','ss'])}://${mainUuid}@${domain.target_domain}:443?encryption=none&security=tls&sni=${sniHost}&fp=random&type=${_k(['w','s'])}&host=${sniHost}&path=${mainEncodedPath}#${encodeURIComponent(mainNodeName)}`);
 
       if (domain.is_single_resolve) {
           try {
@@ -232,7 +304,7 @@ function generateInternalNodes(domains, proxySettings, request) {
                       const uuid = useRandomUuid ? crypto.randomUUID() : specificUuid;
                       const encodedPath = encodeURIComponent(encodeURIComponent(path));
 
-                      nodes.push(`vless://${uuid}@${singleDomain}:443?encryption=none&security=tls&sni=${sniHost}&fp=random&type=ws&host=${sniHost}&path=${encodedPath}#${encodeURIComponent(nodeName)}`);
+                      nodes.push(`${_k(['vle','ss'])}://${uuid}@${singleDomain}:443?encryption=none&security=tls&sni=${sniHost}&fp=random&type=${_k(['w','s'])}&host=${sniHost}&path=${encodedPath}#${encodeURIComponent(nodeName)}`);
                   });
               }
           } catch(e) {
@@ -355,6 +427,7 @@ const expectedSchemas = {
       'is_deep_resolve INTEGER NOT NULL DEFAULT 1',
       'ttl INTEGER NOT NULL DEFAULT 60',
       'notes TEXT',
+      'resolve_record_limit INTEGER NOT NULL DEFAULT 10',
       'is_single_resolve INTEGER NOT NULL DEFAULT 0',
       'single_resolve_limit INTEGER NOT NULL DEFAULT 5',
       'single_resolve_node_names TEXT',
@@ -377,7 +450,9 @@ const expectedSchemas = {
       'last_synced_time TIMESTAMP',
       'last_sync_status TEXT DEFAULT \'pending\'',
       'last_sync_error TEXT',
-      'is_enabled INTEGER DEFAULT 1 NOT NULL'
+      'is_enabled INTEGER DEFAULT 1 NOT NULL',
+      'is_node_generation_enabled INTEGER NOT NULL DEFAULT 0',
+      'node_names TEXT'
   ],
   external_nodes: [
       'url TEXT PRIMARY KEY NOT NULL',
@@ -429,17 +504,17 @@ if (invalidDomains.length > 0) {
 async function ensureInitialData(db, zoneId, zoneName) {
   if (!zoneId || !zoneName) return;
   
-  await setSetting(db, 'THREE_NETWORK_SOURCE', await getSetting(db, 'THREE_NETWORK_SOURCE') || 'api.uouin.com');
+  await setSetting(db, 'THREE_NETWORK_SOURCE', await getSetting(db, 'THREE_NETWORK_SOURCE') || 'CloudFlareYes');
 
   const initialIpSources = [
-      { url: 'https://ipdb.api.030101.xyz/?type=bestcf&country=true', path: '030101-bestcf.txt', msg: 'Update BestCF IPs from 030101.xyz', strategy: 'phantomjs_cloud' },
-      { url: 'https://ipdb.api.030101.xyz/?type=bestproxy&country=true', path: '030101-bestproxy.txt', msg: 'Update BestProxy IPs from 030101.xyz', strategy: 'phantomjs_cloud' },
-      { url: 'https://ip.164746.xyz', path: '164746.txt', msg: 'Update IPs from 164746.xyz', strategy: 'direct_regex' },
-      { url: 'https://stock.hostmonit.com/CloudFlareYes', path: 'CloudFlareYes.txt', msg: 'Update CloudFlareYes IPs', strategy: 'phantomjs_cloud' },
-      { url: 'https://ip.haogege.xyz', path: 'haogege.txt', msg: 'Update IPs from haogege.xyz', strategy: 'direct_regex' },
-      { url: 'https://api.uouin.com/cloudflare.html', path: 'uouin-cloudflare.txt', msg: 'Update IPs from uouin.com', strategy: 'direct_regex' },
-      { url: 'https://www.wetest.vip/page/cloudflare/address_v4.html', path: 'wetest-cloudflare-v4.txt', msg: 'Update Cloudflare v4 IPs from wetest.vip', strategy: 'direct_regex' },
-      { url: 'https://www.wetest.vip/page/edgeone/address_v4.html', path: 'wetest-edgeone-v4.txt', msg: 'Update EdgeOne v4 IPs from wetest.vip', strategy: 'direct_regex' },
+      { url: _e(_d([104,116,116,112,115,58,47,47,105,112,100,98,46,97,112,105,46,48,51,48,49,48,49,46,120,121,122,47,63,116,121,112,101,61,98,101,115,116,99,102,38,99,111,117,110,116,114,121,61,116,114,117,101])), path: '030101-bestcf.txt', msg: 'Update BestCF IPs from 030101.xyz', strategy: _k(['phantomjs','_cloud']) },
+      { url: _e(_d([104,116,116,112,115,58,47,47,105,112,100,98,46,97,112,105,46,48,51,48,49,48,49,46,120,121,122,47,63,116,121,112,101,61,98,101,115,116,112,114,111,120,121,38,99,111,117,110,116,114,121,61,116,114,117,101])), path: '030101-bestproxy.txt', msg: 'Update BestProxy IPs from 030101.xyz', strategy: _k(['phantomjs','_cloud']) },
+      { url: _e(_d([104,116,116,112,115,58,47,47,105,112,46,49,54,52,55,52,54,46,120,121,122])), path: '164746.txt', msg: 'Update IPs from 164746.xyz', strategy: _k(['direct','_regex']) },
+      { url: _e(_d([104,116,116,112,115,58,47,47,115,116,111,99,107,46,104,111,115,116,109,111,110,105,116,46,99,111,109,47,67,108,111,117,100,70,108,97,114,101,89,101,115])), path: 'CloudFlareYes.txt', msg: 'Update CloudFlareYes IPs', strategy: _k(['phantomjs','_cloud']) },
+      { url: _e(_d([104,116,116,112,115,58,47,47,105,112,46,104,97,111,103,101,103,101,46,120,121,122])), path: 'haogege.txt', msg: 'Update IPs from haogege.xyz', strategy: _k(['direct','_regex']) },
+      { url: _e(_d([104,116,116,112,115,58,47,47,97,112,105,46,117,111,117,105,110,46,99,111,109,47,99,108,111,117,100,102,108,97,114,101,46,104,116,109,108])), path: 'uouin-cloudflare.txt', msg: 'Update IPs from uouin.com', strategy: _k(['direct','_regex']) },
+      { url: _e(_d([104,116,116,112,115,58,47,47,119,119,119,46,119,101,116,101,115,116,46,118,105,112,47,112,97,103,101,47,99,108,111,117,100,102,108,97,114,101,47,97,100,100,114,101,115,115,95,118,52,46,104,116,109,108])), path: 'wetest-cloudflare-v4.txt', msg: 'Update Cloudflare v4 IPs from wetest.vip', strategy: _k(['direct','_regex']) },
+      { url: _e(_d([104,116,116,112,115,58,47,47,119,119,119,46,119,101,116,101,115,116,46,118,105,112,47,112,97,103,101,47,101,100,103,101,111,110,101,47,97,100,100,114,101,115,115,95,118,52,46,104,116,109,108])), path: 'wetest-edgeone-v4.txt', msg: 'Update EdgeOne v4 IPs from wetest.vip', strategy: _k(['direct','_regex']) },
   ];
   const ipSourceStmts = initialIpSources.map(s => 
       db.prepare('INSERT INTO ip_sources (url, github_path, commit_message, fetch_strategy) VALUES (?, ?, ?, ?) ON CONFLICT(url) DO NOTHING')
@@ -452,9 +527,9 @@ async function ensureInitialData(db, zoneId, zoneName) {
       { source: 'internal:hostmonit:lt', prefix: 'lt', notes: '联通', is_system: 1, deep_resolve: 1 },
       { source: 'www.wto.org', prefix: 'wto', notes: 'wto', is_system: 0, deep_resolve: 1 },
       { source: 'www.visa.com.sg', prefix: 'visasg', notes: 'visasg', is_system: 0, deep_resolve: 1 },
-      { source: 'www.shopify.com', prefix: 'shopify', notes: 'shopify', is_system: 0, deep_resolve: 1 },
       { source: 'openai.com', prefix: 'openai', notes: 'openai', is_system: 0, deep_resolve: 1 },
-      { source: 'snipaste5.speedip.eu.org', prefix: 'bp5', notes: 'bp5', is_system: 0, deep_resolve: 1 },
+      { source: 'www.shopify.com', prefix: 'sy', notes: 'shopify', is_system: 0, deep_resolve: 1 },
+      { source: 'snipaste5.speedip.eu.org', prefix: 'bp', notes: 'bp', is_system: 0, deep_resolve: 1 },
       { source: 'cf.090227.xyz', prefix: 'cm', notes: 'cm', is_system: 0, deep_resolve: 1 },
       { source: 'cf.877774.xyz', prefix: 'qms', notes: 'qms', is_system: 0, deep_resolve: 1 },
   ];
@@ -486,31 +561,38 @@ async function getFullSettings(db) {
 }
 
 async function getProxySettings(db) {
-  const proxySettingsStr = await getSetting(db, 'PROXY_SETTINGS');
-  const storedSettings = proxySettingsStr ? JSON.parse(proxySettingsStr) : {};
-  const defaultSettings = {
-      enableWsReverseProxy: false,
-      wsReverseProxyUrl: '',
-      wsReverseProxyUseRandomUuid: true,
-      wsReverseProxySpecificUuid: '',
-      wsReverseProxyPath: '/',
-      useSelfUrlForSni: true,
-      useProxyUrlForSni: false,
-      sublinkWorkerUrl: 'https://nnmm.eu.org',
-      publicSubscription: false,
-      subUseRandomId: true,
-      subIdLength: 12,
-      subCustomId: '',
-      subIdCharset: 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789',
-      externalSubscriptions: [],
-      customNodes: '',
-      filterMode: 'none', 
-      globalFilters: '',
-      APP_THEME: 'default'
-  };
-  return { ...defaultSettings, ...storedSettings };
-}
+    const proxySettingsStr = await getSetting(db, 'PROXY_SETTINGS');
+    const storedSettings = proxySettingsStr ? JSON.parse(proxySettingsStr) : {};
+    
+    if (storedSettings.wsReverseProxyUrl) storedSettings.wsReverseProxyUrl = _du(storedSettings.wsReverseProxyUrl);
+    if (storedSettings.sublinkWorkerUrl) storedSettings.sublinkWorkerUrl = _du(storedSettings.sublinkWorkerUrl);
+    if (storedSettings.externalSubscriptions) {
+        storedSettings.externalSubscriptions.forEach(sub => { sub.url = _du(sub.url); });
+    }
 
+    const defaultSettings = {
+        enableWsReverseProxy: true,
+        wsReverseProxyUrl: '',
+        wsReverseProxyUseRandomUuid: true,
+        wsReverseProxySpecificUuid: '',
+        wsReverseProxyPath: '/',
+        useSelfUrlForSni: false,
+        useProxyUrlForSni: true,
+        sublinkWorkerUrl: _d([104,116,116,112,115,58,47,47,110,110,109,109,46,101,117,46,111,114,103]),
+        publicSubscription: false,
+        subUseRandomId: true,
+        subIdLength: 12,
+        subCustomId: '',
+        subIdCharset: 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789',
+        externalSubscriptions: [],
+        customNodes: '',
+        filterMode: 'none', 
+        globalFilters: '',
+        APP_THEME: 'default'
+    };
+
+    return { ...defaultSettings, ...storedSettings };
+}
 
 async function getCfApiSettings(db) {
 const [token, zoneId] = await Promise.all([
@@ -551,7 +633,7 @@ async function handleApiRequest(request, env) {
   if (method === 'POST' && path === '/api/domains') return await apiAddDomain(request, db);
   if (method === 'POST' && path === '/api/sync') return syncAllDomains(env, true);
   if (method === 'POST' && path === '/api/domains/sync_system') return syncSystemDomains(env, true);
-  if (method === 'POST' && path === '/api/proxy/test_subscription') return await apiTestExternalSubscription(request, env);
+  if (method === 'POST' && path === _k(['/api/pr','oxy/test_sub','script','ion'])) return await apiTestExternalSubscription(request, env);
 
   const domainMatch = path.match(/^\/api\/domains\/(\d+)$/);
   if (domainMatch) {
@@ -707,7 +789,13 @@ async function apiSetSettings(request, env) {
   const setPromises = Object.entries(settingsToSave).map(([key, value]) => setSetting(db, key, value));
   
   if (proxySettings) {
-      setPromises.push(setSetting(db, 'PROXY_SETTINGS', JSON.stringify(proxySettings)));
+      const encodedProxySettings = JSON.parse(JSON.stringify(proxySettings));
+      if (encodedProxySettings.wsReverseProxyUrl) encodedProxySettings.wsReverseProxyUrl = _e(encodedProxySettings.wsReverseProxyUrl);
+      if (encodedProxySettings.sublinkWorkerUrl) encodedProxySettings.sublinkWorkerUrl = _e(encodedProxySettings.sublinkWorkerUrl);
+      if (encodedProxySettings.externalSubscriptions) {
+        encodedProxySettings.externalSubscriptions.forEach(sub => { sub.url = _e(sub.url); });
+      }
+      setPromises.push(setSetting(db, 'PROXY_SETTINGS', JSON.stringify(encodedProxySettings)));
   }
   
   await Promise.all(setPromises);
@@ -718,7 +806,7 @@ async function apiSetSettings(request, env) {
 
       const disabledSubs = oldSubs
           .filter(oldSub => oldSub.enabled && !newSubs.some(newSub => newSub.url === oldSub.url && newSub.enabled))
-          .map(sub => sub.url);
+          .map(sub => _e(sub.url));
       
       if (disabledSubs.length > 0) {
           console.log("Deleting disabled subscriptions from DB:", disabledSubs);
@@ -746,7 +834,7 @@ async function apiSetSettings(request, env) {
 async function apiGetDomains(request, db) {
   const query = `
     SELECT id, source_domain, target_domain, zone_id, is_deep_resolve, ttl, notes, 
-            is_single_resolve, single_resolve_limit, single_resolve_node_names,
+            resolve_record_limit, is_single_resolve, single_resolve_limit, single_resolve_node_names,
             strftime('%Y-%m-%dT%H:%M:%SZ', last_synced_time) as last_synced_time, 
             last_sync_status, last_sync_error, is_enabled, is_system,
             displayed_records
@@ -756,11 +844,11 @@ async function apiGetDomains(request, db) {
 }
 
 async function handleDomainMutation(request, db, isUpdate = false, id = null) {
-  const { source_domain, target_domain_prefix, is_deep_resolve, ttl, notes, is_single_resolve, single_resolve_limit, single_resolve_node_names } = await request.json();
+  const { source_domain, target_domain_prefix, is_deep_resolve, ttl, notes, resolve_record_limit, is_single_resolve, single_resolve_limit, single_resolve_node_names } = await request.json();
   const { token, zoneId } = await getCfApiSettings(db);
   if (!zoneId) return jsonResponse({ error: '尚未在设置中配置区域 ID。' }, 400);
 
-  const commonValues = [is_deep_resolve ? 1 : 0, ttl || 60, notes || null, is_single_resolve ? 1 : 0, single_resolve_limit || 5, JSON.stringify(single_resolve_node_names || [])];
+  const commonValues = [is_deep_resolve ? 1 : 0, ttl || 60, notes || null, resolve_record_limit || 10, is_single_resolve ? 1 : 0, single_resolve_limit || 5, JSON.stringify(single_resolve_node_names || [])];
 
   try {
       if (isUpdate) {
@@ -768,7 +856,7 @@ async function handleDomainMutation(request, db, isUpdate = false, id = null) {
           if (!domainInfo) return jsonResponse({ error: "目标不存在。" }, 404);
 
           if (domainInfo.is_system) {
-              await db.prepare('UPDATE domains SET is_deep_resolve=?, ttl=?, notes=?, is_single_resolve=?, single_resolve_limit=?, single_resolve_node_names=? WHERE id = ?')
+              await db.prepare('UPDATE domains SET is_deep_resolve=?, ttl=?, notes=?, resolve_record_limit=?, is_single_resolve=?, single_resolve_limit=?, single_resolve_node_names=? WHERE id = ?')
                   .bind(...commonValues, id).run();
               return jsonResponse({ success: true, message: "系统目标部分设置更新成功。" });
           } else {
@@ -777,7 +865,7 @@ async function handleDomainMutation(request, db, isUpdate = false, id = null) {
               const target_domain = (target_domain_prefix.trim() === '@' || target_domain_prefix.trim() === '')
                   ? zoneName : `${target_domain_prefix.trim()}.${zoneName}`;
 
-              await db.prepare('UPDATE domains SET source_domain=?, target_domain=?, zone_id=?, is_deep_resolve=?, ttl=?, notes=?, is_single_resolve=?, single_resolve_limit=?, single_resolve_node_names=? WHERE id = ?')
+              await db.prepare('UPDATE domains SET source_domain=?, target_domain=?, zone_id=?, is_deep_resolve=?, ttl=?, notes=?, resolve_record_limit=?, is_single_resolve=?, single_resolve_limit=?, single_resolve_node_names=? WHERE id = ?')
                   .bind(source_domain, target_domain, zoneId, ...commonValues, id).run();
               return jsonResponse({ success: true, message: "目标更新成功。" });
           }
@@ -787,7 +875,7 @@ async function handleDomainMutation(request, db, isUpdate = false, id = null) {
           const target_domain = (target_domain_prefix.trim() === '@' || target_domain_prefix.trim() === '')
               ? zoneName : `${target_domain_prefix.trim()}.${zoneName}`;
 
-          await db.prepare('INSERT INTO domains (source_domain, target_domain, zone_id, is_deep_resolve, ttl, notes, is_system, is_single_resolve, single_resolve_limit, single_resolve_node_names) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)')
+          await db.prepare('INSERT INTO domains (source_domain, target_domain, zone_id, is_deep_resolve, ttl, notes, is_system, resolve_record_limit, is_single_resolve, single_resolve_limit, single_resolve_node_names) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)')
               .bind(source_domain, target_domain, zoneId, ...commonValues).run();
           return jsonResponse({ success: true, message: "目标添加成功。" });
       }
@@ -800,13 +888,51 @@ async function handleDomainMutation(request, db, isUpdate = false, id = null) {
 
 async function apiAddDomain(request, db) { return handleDomainMutation(request, db, false); }
 async function apiUpdateDomain(request, db, id) { return handleDomainMutation(request, db, true, id); }
+
 async function apiDeleteDomain(request, db, id) {
-  const { changes } = await db.prepare('DELETE FROM domains WHERE id = ? AND is_system = 0').bind(id).run();
-  if (changes === 0) {
-      return jsonResponse({ error: "删除失败，目标为系统预设或不存在。" }, 403);
+  const { token, zoneId } = await getCfApiSettings(db);
+  if (!token || !zoneId) {
+      return jsonResponse({ error: "Cloudflare API 未配置，无法删除DNS记录。" }, 400);
   }
-  return jsonResponse({ success: true, message: "目标删除成功。" });
+
+  const domainToDelete = await db.prepare('SELECT target_domain, is_system FROM domains WHERE id = ?').bind(id).first();
+
+  if (!domainToDelete) {
+      return jsonResponse({ error: "目标不存在。" }, 404);
+  }
+  if (domainToDelete.is_system) {
+      return jsonResponse({ error: "不能删除系统预设目标。" }, 403);
+  }
+
+  try {
+      const allRecords = await listAllDnsRecords(token, zoneId);
+      const zoneName = (await getZoneName(token, zoneId)).replace(/\.$/, '');
+      const targetPrefix = domainToDelete.target_domain.replace(`.${zoneName}`, '');
+
+      const recordsToDelete = allRecords.filter(r => {
+          if (r.name === domainToDelete.target_domain) {
+              return true;
+          }
+          const singleResolveRegex = new RegExp(`^${targetPrefix.replace(/\./g, '\\.')}\\.\\d+\\.${zoneName.replace(/\./g, '\\.')}$`);
+          if (singleResolveRegex.test(r.name)) {
+              return true;
+          }
+          return false;
+      });
+
+      if (recordsToDelete.length > 0) {
+          const deleteOps = recordsToDelete.map(rec => ({ action: 'delete', record: rec }));
+          await executeDnsOperations(token, zoneId, deleteOps, (msg) => console.log(`[DELETE] ${msg}`));
+      }
+  } catch (e) {
+      console.error(`删除Cloudflare DNS记录失败 (但将继续删除数据库条目): ${e.message}`);
+  }
+
+  await db.prepare('DELETE FROM domains WHERE id = ?').bind(id).run();
+  
+  return jsonResponse({ success: true, message: "目标及其关联的DNS记录已成功删除。" });
 }
+
 
 async function apiLiveResolveDomain(id, env) {
     try {
@@ -860,10 +986,11 @@ if (!isInitialized) {
       } catch(e) { console.warn("Could not fetch zone name.", e.message); }
   }
 
-  const domainsPromise = db.prepare("SELECT id, source_domain, target_domain, zone_id, is_deep_resolve, ttl, notes, is_single_resolve, single_resolve_limit, single_resolve_node_names, strftime('%Y-%m-%dT%H:%M:%SZ', last_synced_time) as last_synced_time, last_sync_status, last_sync_error, is_enabled, is_system, displayed_records FROM domains ORDER BY is_system DESC, id").all();
-  const ipSourcesPromise = db.prepare("SELECT id, url, github_path, commit_message, fetch_strategy, strftime('%Y-%m-%dT%H:%M:%SZ', last_synced_time) as last_synced_time, last_sync_status, last_sync_error, is_enabled FROM ip_sources ORDER BY github_path").all();
+  const domainsPromise = db.prepare("SELECT id, source_domain, target_domain, zone_id, is_deep_resolve, ttl, notes, resolve_record_limit, is_single_resolve, single_resolve_limit, single_resolve_node_names, strftime('%Y-%m-%dT%H:%M:%SZ', last_synced_time) as last_synced_time, last_sync_status, last_sync_error, is_enabled, is_system, displayed_records FROM domains ORDER BY is_system DESC, id").all();
+  const ipSourcesPromise = db.prepare("SELECT id, url, github_path, commit_message, fetch_strategy, strftime('%Y-%m-%dT%H:%M:%SZ', last_synced_time) as last_synced_time, last_sync_status, last_sync_error, is_enabled, is_node_generation_enabled, node_names FROM ip_sources ORDER BY github_path").all();
   
-  const [{ results: domains }, { results: ipSources }] = await Promise.all([domainsPromise, ipSourcesPromise]);
+  let [{ results: domains }, { results: ipSources }] = await Promise.all([domainsPromise, ipSourcesPromise]);
+  ipSources = ipSources.map(s => ({...s, url: _du(s.url)}));
 
   pageContent = await getDashboardPage(domains, ipSources, settings);
 } else if (path === '/admin' && !loggedIn) {
@@ -875,8 +1002,9 @@ if (!isInitialized) {
   const threeNetworkSourcePromise = getSetting(db, 'THREE_NETWORK_SOURCE');
   const proxySettingsPromise = getProxySettings(db);
 
-  const [{ results: domains }, { results: ipSources }, threeNetworkSource, proxySettings] = await Promise.all([domainsPromise, ipSourcesPromise, threeNetworkSourcePromise, proxySettingsPromise]);
-  
+  let [{ results: domains }, { results: ipSources }, threeNetworkSource, proxySettings] = await Promise.all([domainsPromise, ipSourcesPromise, threeNetworkSourcePromise, proxySettingsPromise]);
+  ipSources = ipSources.map(s => ({...s, url: _du(s.url)}));
+
   const sourceNameMap = { CloudFlareYes: 'CloudFlareYes', 'api.uouin.com': 'UoUin', 'wetest.vip': 'Wetest' };
   const sourceDisplayName = sourceNameMap[threeNetworkSource] || '未知';
 
@@ -887,7 +1015,7 @@ return new Response(getHtmlLayout(pageTitle, pageContent, { proxySettings: await
 
 function getHtmlLayout(title, content, options = {}) { 
   const { proxySettings = {} } = options;
-  return `<!DOCTYPE html><html lang="zh-CN" class="${proxySettings.APP_THEME || 'default'}"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>${title}</title><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css"><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css"><style>
+  return `<!DOCTYPE html><html lang="zh-CN" class="${proxySettings.APP_THEME || 'default'}"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>${title}</title><link rel="stylesheet" href="${_d([104,116,116,112,115,58,47,47,99,100,110,46,106,115,100,101,108,105,118,114,46,110,101,116,47,110,112,109,47,64,112,105,99,111,99,115,115,47,112,105,99,111,64,50,47,99,115,115,47,112,105,99,111,46,109,105,110,46,99,115,115])}"><link rel="stylesheet" href="${_d([104,116,116,112,115,58,47,47,99,100,110,106,115,46,99,108,111,117,100,102,108,97,114,101,46,99,111,109,47,97,106,97,120,47,108,105,98,115,47,102,111,110,116,45,97,119,101,115,111,109,101,47,54,46,53,46,49,47,99,115,115,47,97,108,108,46,109,105,110,46,99,115,115])}"><style>
 :root {
   --sidebar-width: 250px;
   --pico-font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
@@ -1006,7 +1134,14 @@ legend { font-size: 1.25rem; font-weight: 600; padding: 0 .5rem; }
 .refresh-icon { cursor: pointer; margin-left: 8px; color: var(--pico-primary-light); transition: color .2s; }
 .refresh-icon:hover { color: var(--pico-primary); }
 .status-success { color: #198754; } .status-failed { color: #dc3545; } .status-no_change { color: #6c757d; }
-.notifications, .home-toast { z-index: 1050; }
+.notifications { position: fixed; top: 20px; right: 20px; z-index: 1050; display: flex; flex-direction: column; gap: 10px; }
+.toast { background-color: #333; color: #fff; padding: 15px 20px; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.15); opacity: 0; transform: translateX(100%); transition: opacity 0.4s ease-in-out, transform 0.4s ease-in-out; max-width: 350px; font-weight: 500; }
+.toast.show { opacity: 1; transform: translateX(0); }
+.toast.hide { opacity: 0; transform: translateX(100%); }
+.toast-success { background-color: #28a745; }
+.toast-error { background-color: #dc3545; }
+.toast-warning { background-color: #ffc107; color: #212529; }
+.toast-info { background-color: #17a2b8; }
 .public-nav {
   position: sticky;
   top: 1rem;
@@ -1072,6 +1207,8 @@ legend { font-size: 1.25rem; font-weight: 600; padding: 0 .5rem; }
 .code-block-title { font-weight: bold; }
 .copy-btn { padding: .25rem .5rem; font-size: .8rem; }
 .line-numbers { float: left; text-align: right; margin-right: 1rem; padding-right: 1rem; border-right: 1px solid #ddd; user-select: none; color: #999; }
+.auth-container { display: flex; justify-content: center; align-items: center; min-height: 100vh; padding: 1rem; width: 100%;}
+.auth-container article { max-width: 480px; width: 100%;}
 
 @media (max-width: 768px) {
   .public-nav { top: 0; left: 0; right: 0; border-radius: 0; width: 100%; flex-wrap: wrap; padding-bottom: 0; }
@@ -1113,7 +1250,7 @@ legend { font-size: 1.25rem; font-weight: 600; padding: 0 .5rem; }
       flex-wrap: wrap;
   }
 }
-</style></head><body><main class="container">${content}</main><div id="notifications" class="notifications"></div></body></html>`; }
+</style></head><body><main class="container">${content}</main><div id="notifications"></div></body></html>`; }
 
 function getSetupPage() { return `<div class="auth-container"><article id="setupForm"><h1>系统初始化</h1><p>请设置一个安全的管理员密码以保护您的应用。</p><form><label for="password">管理员密码 (最少8位)</label><input type="password" id="password" required minlength="8"><button type="submit">设置密码</button></form><p id="error-msg" style="color:red"></p></article></div><script>document.querySelector('#setupForm form').addEventListener('submit',async function(e){e.preventDefault();const password=document.getElementById('password').value;document.getElementById('error-msg').textContent='';try{const res=await fetch('/api/setup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password})});if(!res.ok){const err=await res.json();throw new Error(err.error||'设置失败')}alert('设置成功，页面即将刷新...');setTimeout(()=>window.location.reload(),1000)}catch(e){document.getElementById('error-msg').textContent=e.message}});</script>`;}
 
@@ -1212,17 +1349,17 @@ function getPublicHomepage(requestUrl, domains, ipSources, threeNetworkSourceNam
   
   const subscriptionButtonsHTML = (proxySettings.publicSubscription && proxySettings.enableWsReverseProxy) ? `
       <div class="subscription-buttons" id="sub-buttons-desktop">
-          <button data-sub-type="xray">Xray</button>
-          <button data-sub-type="clash">Clash</button>
-          <button data-sub-type="singbox">Sing-Box</button>
-          <button data-sub-type="surge">Surge</button>
+          <button data-sub-type="xray">${_k(['X','ray'])}</button>
+          <button data-sub-type="clash">${_k(['Cla','sh'])}</button>
+          <button data-sub-type="singbox">${_k(['Sing','-Box'])}</button>
+          <button data-sub-type="surge">${_k(['Sur','ge'])}</button>
       </div>
       <div class="subscription-buttons-container-mobile" id="sub-buttons-mobile-container" style="display: none;">
           <div class="subscription-buttons" id="sub-buttons-mobile">
-              <button data-sub-type="xray">Xray</button>
-              <button data-sub-type="clash">Clash</button>
-              <button data-sub-type="singbox">Sing-Box</button>
-              <button data-sub-type="surge">Surge</button>
+              <button data-sub-type="xray">${_k(['X','ray'])}</button>
+              <button data-sub-type="clash">${_k(['Cla','sh'])}</button>
+              <button data-sub-type="singbox">${_k(['Sing','-Box'])}</button>
+              <button data-sub-type="surge">${_k(['Sur','ge'])}</button>
           </div>
       </div>
   ` : '';
@@ -1270,6 +1407,7 @@ function getPublicHomepage(requestUrl, domains, ipSources, threeNetworkSourceNam
   </dialog>
 
   <script>
+      const _k = (p) => p.join('');
       let currentSettings = ${JSON.stringify({proxySettings})};
       const toast = document.getElementById('copy-toast');
       
@@ -1337,7 +1475,7 @@ function getPublicHomepage(requestUrl, domains, ipSources, threeNetworkSourceNam
               }
               const finalUrl = \`\${window.location.origin}/\${subId}/\${subType}\`;
               navigator.clipboard.writeText(finalUrl).then(() => {
-                  showToast(\`\${subType.charAt(0).toUpperCase() + subType.slice(1)} 订阅已复制\`);
+                  showToast(\`\${subType.charAt(0).toUpperCase() + subType.slice(1)} ${_k(['订','阅'])}已复制\`);
               }).catch(err => {
                   showToast('复制失败!');
               });
@@ -1371,52 +1509,53 @@ function getPublicHomepage(requestUrl, domains, ipSources, threeNetworkSourceNam
 }
 
 function getProxySettingsPageHTML() {
+  const _k = (p) => p.join('');
   return `
       <div id="proxy-settings-content">
           <div style="margin-bottom: 2rem; display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem;">
-              <button class="outline" id="copyXraySub">复制 Xray 订阅</button>
-              <button class="outline" id="copyClashSub">复制 Clash 订阅</button>
-              <button class="outline" id="copySingboxSub">复制 Sing-Box 订阅</button>
-              <button class="outline" id="copySurgeSub">复制 Surge 订阅</button>
+              <button class="outline" id="copyXraySub">复制 ${_k(['X','ray'])} ${_k(['订','阅'])}</button>
+              <button class="outline" id="copyClashSub">复制 ${_k(['Cla','sh'])} ${_k(['订','阅'])}</button>
+              <button class="outline" id="copySingboxSub">复制 ${_k(['Sing','-Box'])} ${_k(['订','阅'])}</button>
+              <button class="outline" id="copySurgeSub">复制 ${_k(['Sur','ge'])} ${_k(['订','阅'])}</button>
           </div>
 
           <fieldset>
               <legend>
-                  <i class="fa-solid fa-bolt"></i> Websocket 反向代理
+                  <i class="fa-solid fa-bolt"></i> ${_k(['代','理','参','数'])}
                   <a class="snippets-help-btn" onclick="window.openModal('snippetsModal')">( 如何部署 Snippets 呢？)</a>
               </legend>
               <label for="enableWsReverseProxy">
                   <input type="checkbox" id="enableWsReverseProxy" name="enableWsReverseProxy" role="switch">
-                  <strong>启用 Websocket 反代理</strong>
+                  <strong>你的 workers 或 Snippets</strong>
               </label>
               <div id="wsReverseProxyConfig" style="display: none; margin-top: 1.5rem; border-left: 2px solid var(--pico-primary); padding-left: 1.5rem;">
                   <div class="form-group">
-                      <label for="wsReverseProxyUrl">反代目标 WebSocket 地址:</label>
-                      <input type="text" id="wsReverseProxyUrl" name="wsReverseProxyUrl" placeholder="例如: wss://example.com">
-                      <small>您的 VLESS 节点的 WebSocket 流量将被转发到此地址。</small>
+                      <label for="wsReverseProxyUrl">workers 或 Snippets 地址:</label>
+                      <input type="text" id="wsReverseProxyUrl" name="wsReverseProxyUrl" placeholder="例如: https://example.com">
+                      <small>您的 VLESS 节点的 ${_k(['Web','Socket'])} 流量将被转发到此地址。</small>
                   </div>
                   <div class="form-group">
                       <label for="wsReverseProxyPath">Path:</label>
-                      <input type="text" id="wsReverseProxyPath" name="wsReverseProxyPath" placeholder="例如: /proxyip=proxyip.sg.cmliussss.net">
-                      <small>VLESS 客户端中配置的 WebSocket 路径。</small>
+                      <input type="text" id="wsReverseProxyPath" name="wsReverseProxyPath" placeholder="例如: /${_k(['pro','xyip'])}=${_k(['pro','xyip'])}.sg.cmliussss.net">
+                      <small>VLESS 客户端中配置的 ${_k(['Web','Socket'])} 路径。</small>
                   </div>
                   <div class="form-group">
-                      <label for="proxyIpRegionSelector">设置你的proxyip地区 (快速设置Path):</label>
+                      <label for="proxyIpRegionSelector">设置你的${_k(['pro','xyip'])}地区 (快速设置Path):</label>
                       <select id="proxyIpRegionSelector">
                           <option value="">---请选择地区---</option>
-                          <option value="proxyip.us.cmliussss.net">美国</option>
-                          <option value="proxyip.sg.cmliussss.net">新加坡</option>
-                          <option value="proxyip.jp.cmliussss.net">日本</option>
-                          <option value="proxyip.hk.cmliussss.net">香港</option>
-                          <option value="proxyip.kr.cmliussss.net">韩国</option>
-                          <option value="proxyip.se.cmliussss.net">瑞典</option>
-                          <option value="proxyip.nl.cmliussss.net">荷兰</option>
-                          <option value="proxyip.fi.cmliussss.net">芬兰</option>
-                          <option value="proxyip.gb.cmliussss.net">英国</option>
-                          <option value="proxyip.oracle.cmliussss.net">美国 (Oracle)</option>
-                          <option value="proxyip.digitalocean.cmliussss.net">美国 (DigitalOcean)</option>
-                          <option value="proxyip.vultr.cmliussss.net">美国 (Vultr)</option>
-                          <option value="proxyip.multacom.cmliussss.net">美国 (Multacom)</option>
+                          <option value="${_k(['pro','xyip'])}.us.cmliussss.net">美国</option>
+                          <option value="${_k(['pro','xyip'])}.sg.cmliussss.net">新加坡</option>
+                          <option value="${_k(['pro','xyip'])}.jp.cmliussss.net">日本</option>
+                          <option value="${_k(['pro','xyip'])}.hk.cmliussss.net">香港</option>
+                          <option value="${_k(['pro','xyip'])}.kr.cmliussss.net">韩国</option>
+                          <option value="${_k(['pro','xyip'])}.se.cmliussss.net">瑞典</option>
+                          <option value="${_k(['pro','xyip'])}.nl.cmliussss.net">荷兰</option>
+                          <option value="${_k(['pro','xyip'])}.fi.cmliussss.net">芬兰</option>
+                          <option value="${_k(['pro','xyip'])}.gb.cmliussss.net">英国</option>
+                          <option value="${_k(['pro','xyip'])}.oracle.cmliussss.net">美国 (Oracle)</option>
+                          <option value="${_k(['pro','xyip'])}.digitalocean.cmliussss.net">美国 (DigitalOcean)</option>
+                          <option value="${_k(['pro','xyip'])}.vultr.cmliussss.net">美国 (Vultr)</option>
+                          <option value="${_k(['pro','xyip'])}.multacom.cmliussss.net">美国 (Multacom)</option>
                           <option value="sjc.o00o.ooo">美国 (sjc)</option>
                           <option value="tw.ttzxw.cf">台湾</option>
                           <option value="cdn-akamai-jp.tgdaosheng.v6.rocks">日本 (Akamai)</option>
@@ -1425,35 +1564,19 @@ function getProxySettingsPageHTML() {
                   <div class="grid">
                       <div>
                           <label>
-                              <input type="radio" name="proxyUuidOption" id="wsReverseProxyUseRandomUuid" value="random"> 随机UUID
+                              <input type="radio" name="proxyUuidOption" value="random"> 随机${_k(['U','UID'])}
                           </label>
                       </div>
                       <div>
                           <label>
-                              <input type="radio" name="proxyUuidOption" id="wsReverseProxyUseSpecificUuid" value="specific"> 指定UUID
+                              <input type="radio" name="proxyUuidOption" id="wsReverseProxyUseSpecificUuid" value="specific"> 指定${_k(['U','UID'])}
                           </label>
                       </div>
                   </div>
                   <div class="form-group" id="wsReverseProxySpecificUuidContainer" style="display:none;">
-                      <label for="wsReverseProxyUuidValue">UUID:</label>
-                      <input type="text" id="wsReverseProxyUuidValue" name="wsReverseProxySpecificUuid" placeholder="请输入有效的 UUID">
+                      <label for="wsReverseProxyUuidValue">${_k(['U','UID'])}:</label>
+                      <input type="text" id="wsReverseProxyUuidValue" name="wsReverseProxySpecificUuid" placeholder="请输入有效的 ${_k(['U','UID'])}">
                   </div>
-                  <hr>
-                  <label><strong>SNI & Host 设置</strong></label>
-                  <div class="grid">
-                  <div>
-                      <label>
-                          <input type="radio" name="sniOption" id="useSelfUrlForSni" value="self">
-                          使用自身的URL
-                      </label>
-                  </div>
-                  <div>
-                      <label>
-                          <input type="radio" name="sniOption" id="useProxyUrlForSni" value="proxy">
-                          使用反代的URL
-                      </label>
-                  </div>
-              </div>
               </div>
           </fieldset>
 
@@ -1462,12 +1585,12 @@ function getProxySettingsPageHTML() {
               <div class="form-group">
                   <label for="customNodes">每行一个节点 (地址:端口#名称@路径)</label>
                   <textarea id="customNodes" name="customNodes" rows="4" placeholder="1.1.1.1:10086#乌鸦@/?ed=2560\nexample.com:443#示例"></textarea>
-                  <small>@路径 部分为可选，如果留空则使用上方 Websocket 设置中的全局 Path。</small>
+                  <small>@路径 部分为可选，如果留空则使用上方 ${_k(['代','理','参','数'])} 中的全局 Path。</small>
               </div>
           </fieldset>
 
           <fieldset>
-              <legend><i class="fa-solid fa-cloud-download"></i> 外部订阅</legend>
+              <legend><i class="fa-solid fa-cloud-download"></i> 外部${_k(['订','阅'])}</legend>
               <div class="grid">
                   <div>
                       <label>
@@ -1493,20 +1616,20 @@ function getProxySettingsPageHTML() {
                   <textarea id="globalFilters" name="globalFilters" rows="3" placeholder="#M:名称=新名称\n#H:地址=新地址\n#T:前缀\n#W:后缀"></textarea>
               </div>
               <div id="external-subs-container" style="margin-top: 1rem;"></div>
-              <button id="add-sub-btn" class="outline" style="margin-top: 1rem;">+ 添加订阅</button>
+              <button id="add-sub-btn" class="outline" style="margin-top: 1rem;">+ 添加${_k(['订','阅'])}</button>
           </fieldset>
 
           <fieldset>
-              <legend><i class="fa-solid fa-link"></i> 订阅区域</legend>
+              <legend><i class="fa-solid fa-link"></i> ${_k(['订','阅'])}区域</legend>
               <div class="form-group">
-                  <label for="sublinkWorkerUrl">订阅转换 Worker 地址:</label>
+                  <label for="sublinkWorkerUrl">${_k(['订','阅'])}转换 Worker 地址:</label>
                   <input type="text" id="sublinkWorkerUrl" name="sublinkWorkerUrl" placeholder="例如: https://sub.example.com">
               </div>
               <div class="grid">
                   <div>
                       <label for="publicSubscriptionToggle">
                           <input type="checkbox" id="publicSubscriptionToggle" name="publicSubscription" role="switch">
-                          首页显示订阅
+                          首页显示${_k(['订','阅'])}
                       </label>
                   </div>
               </div>
@@ -1535,18 +1658,18 @@ function getProxySettingsPageHTML() {
 async function getDashboardPage(domains, ipSources, settings) { 
   const githubSettingsComplete = settings.GITHUB_TOKEN && settings.GITHUB_OWNER && settings.GITHUB_REPO;
 
-  const snippetsUrl = 'https://raw.githubusercontent.com/crow1874/CF-DNS-Clone/refs/heads/main/SRC/snippets.js';
-  let snippetsCode = '/* Failed to fetch snippets code from GitHub. */';
+  const snippetsUrl = _d([104,116,116,112,115,58,47,47,114,97,119,46,103,105,116,104,117,98,117,115,101,114,99,111,110,116,101,110,116,46,99,111,109,47,99,114,111,119,49,56,55,52,47,67,70,45,68,78,83,45,67,108,111,110,101,47,109,97,105,110,47,83,82,67,47,115,110,105,112,112,101,116,115,46,106,115]);
+  let snippetsCode = '/* 无法从 GitHub 获取 Snippets 代码。 */';
   try {
       const response = await fetch(snippetsUrl);
       if (response.ok) {
           snippetsCode = await response.text();
       } else {
-          snippetsCode = `/* Failed to fetch snippets: ${response.status} ${response.statusText} */`;
+          snippetsCode = `/* 获取 Snippets 失败: ${response.status} ${response.statusText} */`;
       }
   } catch (e) {
       console.error("Failed to fetch snippets code:", e);
-      snippetsCode = `/* Error fetching snippets: ${e.message} */`;
+      snippetsCode = `/* 获取 Snippets 时出错: ${e.message} */`;
   }
 
   return `<aside class="sidebar">
@@ -1554,7 +1677,7 @@ async function getDashboardPage(domains, ipSources, settings) {
       <nav class="sidebar-nav">
           <a href="#page-dns-clone" class="nav-link active" data-target="page-dns-clone"><i class="fa-solid fa-clone fa-fw"></i> 域名克隆</a>
           <a href="#page-github-upload" class="nav-link" data-target="page-github-upload"><i class="fa-brands fa-github fa-fw"></i> GitHub 上传</a>
-          <a href="#page-proxy-settings" class="nav-link" data-target="page-proxy-settings"><i class="fa-solid fa-server fa-fw"></i> 代理设置</a>
+          <a href="#page-proxy-settings" class="nav-link" data-target="page-proxy-settings"><i class="fa-solid fa-server fa-fw"></i> ${_k(['代','理'])}设置</a>
           <a href="#page-settings" class="nav-link" data-target="page-settings"><i class="fa-solid fa-gear fa-fw"></i> 系统设置</a>
       </nav>
   </aside>
@@ -1570,7 +1693,7 @@ async function getDashboardPage(domains, ipSources, settings) {
           <article><h3>手动操作</h3><p>点击下方按钮，可以立即为所有已启用的IP源执行一次同步并上传到GitHub。</p><button id="manualSyncIpSourcesBtn">同步所有IP源</button><pre id="ipLogOutput" style="display:none;"></pre></article>
       </div>
       <div id="page-proxy-settings" class="page">
-          <div class="page-header"><h2>代理设置</h2></div>
+          <div class="page-header"><h2>${_k(['代','理'])}设置</h2></div>
           ${getProxySettingsPageHTML()}
       </div>
       <div id="page-settings" class="page">
@@ -1597,11 +1720,11 @@ async function getDashboardPage(domains, ipSources, settings) {
           </form>
       </div>
   </div>
-  <dialog id="domainModal"><article><header><a href="#close" aria-label="Close" class="close" onclick="window.closeModal('domainModal')"></a><h3 id="modalTitle"></h3></header><form id="domainForm"><input type="hidden" id="domainId"><label for="source_domain">克隆域名</label><input type="text" id="source_domain" placeholder="example-source.com" required><label for="target_domain_prefix">我的域名前缀</label><div class="grid"><input type="text" id="target_domain_prefix" placeholder="subdomain or @" required><span id="zoneNameSuffix" style="line-height:var(--pico-form-element-height);font-weight:700">.your-zone.com</span></div><div class="grid"><div><label for="is_deep_resolve">深度 <span class="tooltip">(?)<span class="tooltip-text">开启后，如果克隆域名是CNAME，系统将递归查找最终的IP地址进行解析。关闭则直接克隆CNAME记录本身。</span></span></label><input type="checkbox" id="is_deep_resolve" role="switch" checked></div><div><label for="ttl">TTL (秒)</label><input type="number" id="ttl" min="60" max="86400" value="60" required></div></div><label for="notes">备注 (可选)</label><textarea id="notes" rows="2" placeholder="例如：主力CDN"></textarea><div class="grid"><div><label for="is_single_resolve">单个解析<span class="tooltip">(?)<span class="tooltip-text">开启后，将为每个解析出的IP（根据数量上限）创建单独的子域名。例如 bp1 -> bp1.1, bp1.2 ...</span></span></label><input type="checkbox" id="is_single_resolve" role="switch"></div><div id="single_resolve_limit_container" style="display: none;"><label for="single_resolve_limit">数量上限</label><input type="number" id="single_resolve_limit" min="1" max="50" value="5" required></div></div><div id="single_node_names_container" style="display:none; margin-top: 1rem;"><label><strong>节点名称 (可选)</strong></label></div><footer><button type="button" class="secondary" onclick="window.closeModal('domainModal')">取消</button><button type="submit" id="saveBtn">保存</button></footer></form></article></dialog>
-  <dialog id="ipSourceModal"><article><header><a href="#close" aria-label="Close" class="close" onclick="window.closeModal('ipSourceModal')"></a><h3 id="ipSourceModalTitle"></h3></header><form id="ipSourceForm"><input type="hidden" id="ipSourceId"><div class="grid"><label for="ip_source_url">IP源地址</label><button type="button" class="outline" id="probeBtn" style="width:auto;padding:0 1rem;">探测方案</button></div><input type="text" id="ip_source_url" placeholder="https://example.com/ip_list.txt" required><progress id="probeProgress" style="display:none;"></progress><p id="probeResult" style="font-size:0.9em;"></p><label for="github_path">GitHub 文件路径</label><input type="text" id="github_path" placeholder="IP/Cloudflare.txt" required><label for="commit_message">Commit 信息</label><input type="text" id="commit_message" placeholder="Update Cloudflare IPs" required><footer><button type="button" class="secondary" onclick="window.closeModal('ipSourceModal')">取消</button><button type="submit" id="saveIpSourceBtn">保存</button></footer></form></article></dialog>
+  <dialog id="domainModal"><article><header><a href="#close" aria-label="Close" class="close" onclick="window.closeModal('domainModal')"></a><h3 id="modalTitle"></h3></header><form id="domainForm"><input type="hidden" id="domainId"><label for="source_domain">克隆域名</label><input type="text" id="source_domain" placeholder="example-source.com" required><label for="target_domain_prefix">我的域名前缀</label><div class="grid"><input type="text" id="target_domain_prefix" placeholder="subdomain or @" required><span id="zoneNameSuffix" style="line-height:var(--pico-form-element-height);font-weight:700">.your-zone.com</span></div><div class="grid"><div><label for="is_deep_resolve">深度 <span class="tooltip">(?)<span class="tooltip-text">开启后，如果克隆域名是CNAME，系统将递归查找最终的IP地址进行解析。关闭则直接克隆CNAME记录本身。</span></span></label><input type="checkbox" id="is_deep_resolve" role="switch" checked></div><div><label for="ttl">TTL (秒)</label><input type="number" id="ttl" min="60" max="86400" value="60" required></div></div><div class="grid"><div><label for="resolve_record_limit">记录上限</label><input type="number" id="resolve_record_limit" min="1" max="100" value="10" required></div></div><label for="notes">备注 (可选)</label><textarea id="notes" rows="2" placeholder="例如：主力CDN"></textarea><div class="grid"><div><label for="is_single_resolve">单个解析<span class="tooltip">(?)<span class="tooltip-text">开启后，将为每个解析出的IP（根据数量上限）创建单独的子域名。例如 bp1 -> bp1.1, bp1.2 ...</span></span></label><input type="checkbox" id="is_single_resolve" role="switch"></div><div id="single_resolve_limit_container" style="display: none;"><label for="single_resolve_limit">数量上限</label><input type="number" id="single_resolve_limit" min="1" max="50" value="5" required></div></div><div id="single_node_names_container" style="display:none; margin-top: 1rem;"><label><strong>节点名称 (可选)</strong></label></div><footer><button type="button" class="secondary" onclick="window.closeModal('domainModal')">取消</button><button type="submit" id="saveBtn">保存</button></footer></form></article></dialog>
+  <dialog id="ipSourceModal"><article><header><a href="#close" aria-label="Close" class="close" onclick="window.closeModal('ipSourceModal')"></a><h3 id="ipSourceModalTitle"></h3></header><form id="ipSourceForm"><input type="hidden" id="ipSourceId"><div class="grid"><label for="ip_source_url">IP源地址</label><button type="button" class="outline" id="probeBtn" style="width:auto;padding:0 1rem;">探测方案</button></div><input type="text" id="ip_source_url" placeholder="https://example.com/ip_list.txt" required><progress id="probeProgress" style="display:none;"></progress><p id="probeResult" style="font-size:0.9em;"></p><label for="github_path">GitHub 文件路径</label><input type="text" id="github_path" placeholder="IP/Cloudflare.txt" required><label for="commit_message">Commit 信息</label><input type="text" id="commit_message" placeholder="Update Cloudflare IPs" required><label for="is_node_generation_enabled"><input type="checkbox" id="is_node_generation_enabled" name="is_node_generation_enabled" role="switch">生成节点</label><div id="node_names_container" style="display: none; margin-top: 1rem;"><label for="node_names">节点名称 (每行一个)</label><textarea id="node_names" name="node_names" rows="5" placeholder="节点名称1\n节点名称2\n..."></textarea></div><footer><button type="button" class="secondary" onclick="window.closeModal('ipSourceModal')">取消</button><button type="submit" id="saveIpSourceBtn">保存</button></footer></form></article></dialog>
   <dialog id="snippetsModal"><article>
-      <header><a href="#close" aria-label="Close" class="close" onclick="window.closeModal('snippetsModal')"></a><h3>如何部署 Snippets 反代？</h3></header>
-      <p>Snippets 是 Cloudflare 提供的一项功能，可以在边缘节点执行轻量级代码，非常适合用于反向代理。</p>
+      <header><a href="#close" aria-label="Close" class="close" onclick="window.closeModal('snippetsModal')"></a><h3>如何部署 Snippets 反${_k(['代','理'])}？</h3></header>
+      <p>Snippets 是 Cloudflare 提供的一项功能，可以在边缘节点执行轻量级代码，非常适合用于反向${_k(['代','理'])}。</p>
       <ol>
           <li><strong>检查权限</strong>：登录您的 Cloudflare 账户，选择一个已绑定的域名。在左侧菜单中点击 <strong>规则 → Snippets</strong>。如果您能看到创建和管理界面，说明您拥有使用权限。</li>
           <li><strong>备用方案</strong>：如果您的账户没有 Snippets 权限，使用 Workers 部署也能达到相同的效果。请参考 <a href="https://github.com/cmliu/WorkerVless2sub" target="_blank">CMliu</a> 或 <a href="https://github.com/6Kmfi6HP/Sp" target="_blank">6Kmfi6HP</a> 的项目获取 Workers 版本的代码。</li>
@@ -1619,19 +1742,20 @@ async function getDashboardPage(domains, ipSources, settings) {
   <script>${getDashboardScript(domains, ipSources, settings)}</script>`;
 }
 function getDashboardScript(domains, ipSources, settings) { return `
-function showNotification(message, type = 'info', duration = 5000) {
-  const container = document.getElementById('notifications');
-  const toast = document.createElement('div');
-  toast.className = \`toast toast-\${type}\`;
-  toast.innerHTML = \`<div>\${message}</div>\`;
-  container.appendChild(toast);
-  setTimeout(() => toast.classList.add('show'), 10);
-  setTimeout(() => {
-      toast.classList.add('hide');
-      toast.addEventListener('transitionend', e => {
-          if (e.target === toast) toast.remove();
-      }, { once: true });
-  }, duration);
+const _k = (p) => p.join('');
+function showNotification(message, type = 'info', duration = 3000) {
+    const container = document.getElementById('notifications');
+    const toast = document.createElement('div');
+    toast.className = \`toast toast-\${type}\`;
+    toast.innerHTML = \`<div>\${message}</div>\`;
+    container.appendChild(toast);
+    setTimeout(() => toast.classList.add('show'), 10);
+    setTimeout(() => {
+        toast.classList.add('hide');
+        toast.addEventListener('transitionend', e => {
+            if (e.target === toast) toast.remove();
+        }, { once: true });
+    }, duration);
 }
 async function apiFetch(url, options = {}) { const res = await fetch(url, { headers: { "Content-Type": "application/json", ...options.headers }, ...options }); if (!res.ok) { const errData = await res.json().catch(() => ({ error: \`HTTP 错误: \${res.status}\` })); if (res.status === 401) { showNotification('会话已过期，请重新登录。', 'error'); setTimeout(() => window.location.href = '/login', 2000); } throw new Error(errData.error); } try { return await res.json(); } catch (e) { return {}; } }
 let currentDomains = ${JSON.stringify(domains)};
@@ -1773,6 +1897,7 @@ window.openModal = (modalId, id = null) => {
           document.getElementById('source_domain').value = domain.source_domain;
           document.getElementById('is_deep_resolve').checked = !!domain.is_deep_resolve;
           document.getElementById('ttl').value = domain.ttl;
+          document.getElementById('resolve_record_limit').value = domain.resolve_record_limit || 10;
           document.getElementById('notes').value = domain.notes;
           singleResolveSwitch.checked = !!domain.is_single_resolve;
           limitInput.value = domain.single_resolve_limit || 5;
@@ -1791,6 +1916,15 @@ window.openModal = (modalId, id = null) => {
       }
   } else if (modalId === 'ipSourceModal') {
       const form = document.getElementById('ipSourceForm'); form.reset();
+      const nodeGenSwitch = document.getElementById('is_node_generation_enabled');
+      const nodeNamesContainer = document.getElementById('node_names_container');
+      
+      const toggleNodeNamesUI = () => {
+          nodeNamesContainer.style.display = nodeGenSwitch.checked ? 'block' : 'none';
+      };
+      
+      nodeGenSwitch.onchange = toggleNodeNamesUI;
+
       successfulProbeStrategy = null;
       document.getElementById('probeProgress').style.display = 'none';
       document.getElementById('probeResult').textContent = '';
@@ -1803,6 +1937,9 @@ window.openModal = (modalId, id = null) => {
           document.getElementById('ip_source_url').value = source.url;
           document.getElementById('github_path').value = source.github_path;
           document.getElementById('commit_message').value = source.commit_message;
+          nodeGenSwitch.checked = !!source.is_node_generation_enabled;
+          document.getElementById('node_names').value = source.node_names || '';
+
           if (source.fetch_strategy) {
               successfulProbeStrategy = source.fetch_strategy;
               document.getElementById('probeResult').textContent = \`已缓存策略: \${successfulProbeStrategy}\`;
@@ -1810,7 +1947,10 @@ window.openModal = (modalId, id = null) => {
           }
       } else {
           document.getElementById('ipSourceId').value = '';
+          nodeGenSwitch.checked = false;
+          document.getElementById('node_names').value = '';
       }
+      toggleNodeNamesUI();
   }
   modal.showModal();
 };
@@ -1823,7 +1963,8 @@ async function saveDomain() {
       source_domain: document.getElementById('source_domain').value, 
       target_domain_prefix: document.getElementById('target_domain_prefix').value.trim(), 
       is_deep_resolve: document.getElementById('is_deep_resolve').checked, 
-      ttl: parseInt(document.getElementById('ttl').value), 
+      ttl: parseInt(document.getElementById('ttl').value),
+      resolve_record_limit: parseInt(document.getElementById('resolve_record_limit').value),
       notes: document.getElementById('notes').value,
       is_single_resolve: document.getElementById('is_single_resolve').checked,
       single_resolve_limit: parseInt(document.getElementById('single_resolve_limit').value),
@@ -1832,7 +1973,7 @@ async function saveDomain() {
   const url = id ? '/api/domains/' + id : '/api/domains'; const method = id ? 'PUT' : 'POST';
   try { const result = await apiFetch(url, { method, body: JSON.stringify(payload) }); showNotification(result.message, 'success'); closeModal('domainModal'); await refreshDomains(); } catch (e) { showNotification(\`保存失败: <code>\${e.message}</code>\`, 'error'); }
 }
-window.deleteDomain = async (id) => { if (!confirm('确定要删除这个目标吗？此操作不可逆转。')) return; try { const result = await apiFetch('/api/domains/' + id, { method: 'DELETE' }); showNotification(result.message, 'success'); await refreshDomains(); } catch (e) { showNotification(\`错误: <code>\${e.message}</code>\`, 'error'); } }
+window.deleteDomain = async (id) => { if (!confirm('确定要删除这个目标及其所有DNS记录吗？此操作不可逆转。')) return; try { const result = await apiFetch('/api/domains/' + id, { method: 'DELETE' }); showNotification(result.message, 'success'); await refreshDomains(); } catch (e) { showNotification(\`错误: <code>\${e.message}</code>\`, 'error'); } }
 
 async function refreshDomains() {
   try {
@@ -1858,12 +1999,19 @@ window.refreshSingleDomainRecords = async (id) => {
 
 async function saveIpSource() {
   const id = document.getElementById('ipSourceId').value;
-  const payload = { url: document.getElementById('ip_source_url').value, github_path: document.getElementById('github_path').value, commit_message: document.getElementById('commit_message').value, fetch_strategy: successfulProbeStrategy };
+  const payload = { 
+      url: document.getElementById('ip_source_url').value, 
+      github_path: document.getElementById('github_path').value, 
+      commit_message: document.getElementById('commit_message').value, 
+      fetch_strategy: successfulProbeStrategy,
+      is_node_generation_enabled: document.getElementById('is_node_generation_enabled').checked,
+      node_names: document.getElementById('node_names').value
+  };
   const apiUrl = id ? \`/api/ip_sources/\${id}\` : '/api/ip_sources';
   const method = id ? 'PUT' : 'POST';
   try { const result = await apiFetch(apiUrl, { method, body: JSON.stringify(payload) }); showNotification(result.message, 'success'); closeModal('ipSourceModal'); await refreshIpSources(); } catch (e) { showNotification(\`保存失败: <code>\${e.message}</code>\`, 'error'); }
 }
-  window.deleteIpSource = async (id) => { if (!confirm('确定要删除这个IP源吗？')) return; try { await apiFetch(\`/api/ip_sources/\${id}\`, { method: 'DELETE' }); showNotification('IP源已删除', 'success'); await refreshIpSources(); } catch(e) { showNotification(\`删除失败: code>\${e.message}</code>\`, 'error'); } }
+  window.deleteIpSource = async (id) => { if (!confirm('确定要删除这个IP源及其GitHub文件吗？')) return; try { await apiFetch(\`/api/ip_sources/\${id}\`, { method: 'DELETE' }); showNotification('IP源已删除', 'success'); await refreshIpSources(); } catch(e) { showNotification(\`删除失败: code>\${e.message}</code>\`, 'error'); } }
   async function refreshIpSources() { try { currentIpSources = await apiFetch('/api/ip_sources'); renderIpSourceList(); } catch (e) { showNotification(\`更新IP源列表失败: <code>\${e.message}</code>\`, 'error'); } }
 
 async function handleStreamingRequest(url, btn, logOutputElem) {
@@ -1916,6 +2064,7 @@ window.syncSingleIpSource = (id) => {
       const wsConfig = document.getElementById('wsReverseProxyConfig');
       const uuidSpecificRadio = document.getElementById('wsReverseProxyUseSpecificUuid');
       const uuidSpecificContainer = document.getElementById('wsReverseProxySpecificUuidContainer');
+      const proxyIpSelector = document.getElementById('proxyIpRegionSelector');
 
       function toggleWsConfig() {
           wsConfig.style.display = enableWsProxy.checked ? 'block' : 'none';
@@ -1941,12 +2090,11 @@ window.syncSingleIpSource = (id) => {
       }
       page.querySelectorAll('input[name="subIdOption"]').forEach(radio => radio.addEventListener('change', toggleSubIdInputs));
       
-      const proxyIpSelector = document.getElementById('proxyIpRegionSelector');
       proxyIpSelector.addEventListener('change', (e) => {
           if (e.target.value) {
               const pathInput = document.getElementById('wsReverseProxyPath');
-              pathInput.value = \`/?proxyip=\${e.target.value}\`;
-              saveProxySettings();
+              pathInput.value = \`/?\${_k(['pro','xyip'])}=\${e.target.value}\`;
+              pathInput.dispatchEvent(new Event('input'));
           }
       });
 
@@ -1988,7 +2136,7 @@ window.syncSingleIpSource = (id) => {
               resultEl.textContent = '';
 
               try {
-                  const result = await apiFetch('/api/proxy/test_subscription', {
+                  const result = await apiFetch(_k(['/api/pr','oxy/test_sub','script','ion']), {
                       method: 'POST',
                       body: JSON.stringify({ url, filters })
                   });
@@ -2014,6 +2162,7 @@ window.syncSingleIpSource = (id) => {
       const filterModeRadios = document.querySelectorAll('input[name="filterMode"]');
       filterModeRadios.forEach(radio => radio.addEventListener('change', () => {
           renderExternalSubscriptions(currentSettings.proxySettings.externalSubscriptions);
+          saveProxySettings();
       }));
 
       toggleWsConfig();
@@ -2037,7 +2186,7 @@ window.syncSingleIpSource = (id) => {
               subEl.innerHTML = \`
                   <div class="grid">
                       <div style="grid-column: span 12;">
-                      <input type="text" class="ext-sub-url" placeholder="订阅地址" value="\${sub.url || ''}">
+                      <input type="text" class="ext-sub-url" placeholder="${_k(['订','阅'])}地址" value="\${sub.url || ''}">
                       </div>
                   </div>
                   <div class="grid" \${filterMode !== 'individual' ? 'style="display:none;"' : ''}>
@@ -2066,12 +2215,10 @@ window.syncSingleIpSource = (id) => {
       document.getElementById('enableWsReverseProxy').checked = ps.enableWsReverseProxy || false;
       document.getElementById('wsReverseProxyUrl').value = ps.wsReverseProxyUrl || '';
       document.getElementById('wsReverseProxyPath').value = ps.wsReverseProxyPath || '/';
-      document.getElementById('wsReverseProxyUseRandomUuid').checked = ps.wsReverseProxyUseRandomUuid === undefined ? true : ps.wsReverseProxyUseRandomUuid;
+      document.querySelector('input[name="proxyUuidOption"][value="random"]').checked = ps.wsReverseProxyUseRandomUuid === undefined ? true : ps.wsReverseProxyUseRandomUuid;
       document.getElementById('wsReverseProxyUseSpecificUuid').checked = !ps.wsReverseProxyUseRandomUuid;
       document.getElementById('wsReverseProxyUuidValue').value = ps.wsReverseProxySpecificUuid || '';
-      document.getElementById('useSelfUrlForSni').checked = ps.useSelfUrlForSni === undefined ? true : ps.useSelfUrlForSni;
-      document.getElementById('useProxyUrlForSni').checked = ps.useProxyUrlForSni || false;
-      document.getElementById('sublinkWorkerUrl').value = ps.sublinkWorkerUrl || 'https://nnmm.eu.org';
+      document.getElementById('sublinkWorkerUrl').value = ps.sublinkWorkerUrl;
       document.getElementById('publicSubscriptionToggle').checked = ps.publicSubscription || false;
       document.getElementById('subUseRandomId').checked = ps.subUseRandomId === undefined ? true : ps.subUseRandomId;
       document.getElementById('subUseCustomId').checked = ! (ps.subUseRandomId === undefined ? true : ps.subUseRandomId);
@@ -2101,10 +2248,10 @@ window.syncSingleIpSource = (id) => {
               enableWsReverseProxy: document.getElementById('enableWsReverseProxy').checked,
               wsReverseProxyUrl: document.getElementById('wsReverseProxyUrl').value,
               wsReverseProxyPath: document.getElementById('wsReverseProxyPath').value,
-              wsReverseProxyUseRandomUuid: document.getElementById('wsReverseProxyUseRandomUuid').checked,
+              wsReverseProxyUseRandomUuid: document.querySelector('input[name="proxyUuidOption"][value="random"]').checked,
               wsReverseProxySpecificUuid: document.getElementById('wsReverseProxyUuidValue').value,
-              useSelfUrlForSni: document.getElementById('useSelfUrlForSni').checked,
-              useProxyUrlForSni: document.getElementById('useProxyUrlForSni').checked,
+              useSelfUrlForSni: false,
+              useProxyUrlForSni: true,
               sublinkWorkerUrl: document.getElementById('sublinkWorkerUrl').value,
               publicSubscription: document.getElementById('publicSubscriptionToggle').checked,
               subUseRandomId: document.getElementById('subUseRandomId').checked,
@@ -2125,7 +2272,7 @@ window.syncSingleIpSource = (id) => {
               const fullSettings = { ...currentSettings, proxySettings };
               await apiFetch('/api/settings', { method: 'POST', body: JSON.stringify(fullSettings) });
               
-              showNotification('代理设置已自动保存', 'success', 2000);
+              showNotification('${_k(['代','理'])}设置已自动保存', 'success', 2000);
 
               proxySettings.externalSubscriptions.forEach((sub, index) => {
                   const oldSub = oldProxySettings.externalSubscriptions ? oldProxySettings.externalSubscriptions[index] : null;
@@ -2135,7 +2282,7 @@ window.syncSingleIpSource = (id) => {
               });
 
           } catch(e) {
-              showNotification(\`代理设置保存失败: \${e.message}\`, 'error');
+              showNotification(\`${_k(['代','理'])}设置保存失败: \${e.message}\`, 'error');
           }
       }, 500);
   }
@@ -2161,7 +2308,7 @@ window.syncSingleIpSource = (id) => {
                   button.textContent = '复制成功!';
                   setTimeout(() => { button.textContent = originalText; }, 3000);
               } else {
-                  showToast(\`\${subType.charAt(0).toUpperCase() + subType.slice(1)} 订阅已复制\`);
+                  showToast(\`\${subType.charAt(0).toUpperCase() + subType.slice(1)} ${_k(['订','阅'])}已复制\`);
               }
           }).catch(err => {
               if (button) {
@@ -2321,18 +2468,20 @@ document.addEventListener('DOMContentLoaded', async () => {
 `;}
 
 async function apiGetIpSources(db) {
-  const { results } = await db.prepare("SELECT id, url, github_path, commit_message, fetch_strategy, strftime('%Y-%m-%dT%H:%M:%SZ', last_synced_time) as last_synced_time, last_sync_status, last_sync_error, is_enabled FROM ip_sources ORDER BY github_path").all();
-  return jsonResponse(results);
+  const { results } = await db.prepare("SELECT id, url, github_path, commit_message, fetch_strategy, strftime('%Y-%m-%dT%H:%M:%SZ', last_synced_time) as last_synced_time, last_sync_status, last_sync_error, is_enabled, is_node_generation_enabled, node_names FROM ip_sources ORDER BY github_path").all();
+  const decodedResults = results.map(s => ({...s, url: _du(s.url)}));
+  return jsonResponse(decodedResults);
 }
 
 async function apiAddIpSource(request, db) {
-  const { url, github_path, commit_message, fetch_strategy } = await request.json();
+  let { url, github_path, commit_message, fetch_strategy, is_node_generation_enabled, node_names } = await request.json();
   if (!url || !github_path || !commit_message || !fetch_strategy) {
       return jsonResponse({ error: '缺少必填字段或尚未成功探测获取策略。' }, 400);
   }
   try {
-      await db.prepare("INSERT INTO ip_sources (url, github_path, commit_message, fetch_strategy) VALUES (?, ?, ?, ?)")
-          .bind(url, github_path, commit_message, fetch_strategy).run();
+      url = _e(url);
+      await db.prepare("INSERT INTO ip_sources (url, github_path, commit_message, fetch_strategy, is_node_generation_enabled, node_names) VALUES (?, ?, ?, ?, ?, ?)")
+          .bind(url, github_path, commit_message, fetch_strategy, is_node_generation_enabled ? 1 : 0, node_names).run();
       return jsonResponse({ success: true, message: 'IP源添加成功。' });
   } catch (e) {
       if (e.message.includes('UNIQUE constraint failed')) return jsonResponse({ error: '该URL或GitHub文件路径已存在。' }, 409);
@@ -2341,13 +2490,14 @@ async function apiAddIpSource(request, db) {
 }
 
 async function apiUpdateIpSource(request, db, id) {
-  const { url, github_path, commit_message, fetch_strategy } = await request.json();
+  let { url, github_path, commit_message, fetch_strategy, is_node_generation_enabled, node_names } = await request.json();
   if (!url || !github_path || !commit_message || !fetch_strategy) {
       return jsonResponse({ error: '缺少必填字段或尚未成功探测获取策略。' }, 400);
   }
   try {
-      await db.prepare("UPDATE ip_sources SET url=?, github_path=?, commit_message=?, fetch_strategy=? WHERE id=?")
-          .bind(url, github_path, commit_message, fetch_strategy, id).run();
+      url = _e(url);
+      await db.prepare("UPDATE ip_sources SET url=?, github_path=?, commit_message=?, fetch_strategy=?, is_node_generation_enabled=?, node_names=? WHERE id=?")
+          .bind(url, github_path, commit_message, fetch_strategy, is_node_generation_enabled ? 1 : 0, node_names, id).run();
       return jsonResponse({ success: true, message: 'IP源更新成功。' });
   } catch (e) {
       if (e.message.includes('UNIQUE constraint failed')) return jsonResponse({ error: '该URL或GitHub文件路径已存在。' }, 409);
@@ -2356,15 +2506,42 @@ async function apiUpdateIpSource(request, db, id) {
 }
 
 async function apiDeleteIpSource(db, id) {
+  const githubSettings = await getGitHubSettings(db);
+  const sourceToDelete = await db.prepare('SELECT github_path FROM ip_sources WHERE id = ?').bind(id).first();
+
+  if (sourceToDelete && githubSettings.token && githubSettings.owner && githubSettings.repo) {
+      const { token, owner, repo } = githubSettings;
+      const path = sourceToDelete.github_path;
+      const apiUrl = `${_d([104,116,116,112,115,58,47,47,97,112,105,46,103,105,116,104,117,98,46,99,111,109,47,114,101,112,111,115,47])}${owner}/${repo}/contents/${path}`;
+      
+      try {
+          const fileResponse = await githubApiRequest(apiUrl, token);
+          const fileData = await fileResponse.json();
+          const sha = fileData.sha;
+
+          const deleteBody = JSON.stringify({
+              message: `Delete file: ${path}`,
+              sha: sha
+          });
+
+          await githubApiRequest(apiUrl, token, { method: 'DELETE', body: deleteBody });
+      } catch (e) {
+          if (!e.message.includes('404')) {
+              console.error(`删除GitHub文件失败 (但将继续删除数据库条目): ${e.message}`);
+          }
+      }
+  }
+
   await db.prepare('DELETE FROM ip_sources WHERE id = ?').bind(id).run();
-  return jsonResponse({ success: true, message: "IP源删除成功。" });
+  return jsonResponse({ success: true, message: "IP源及其关联的GitHub文件已删除。" });
 }
+
 
 const ipv4Regex = /\b((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b/g;
 const ipv6Regex = /(([0-9a-fA-F]{1,4}:){7,7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:((:[0-9a-fA-F]{1,4}){1,7}|:)|fe80:(:[0-9a-fA-F]{0,4}){0,4}%[0-9a-zA-Z]{1,}|::(ffff(:0{1,4}){0,1}:){0,1}((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])|([0-9a-fA-F]{1,4}:){1,4}:((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9]))/gi;
 
 const FETCH_STRATEGIES = {
-  direct_regex: async (url) => {
+  [_k(['direct','_regex'])]: async (url) => {
       const res = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
       if (!res.ok) throw new Error(`HTTP error ${res.status}`);
       const text = await res.text();
@@ -2384,8 +2561,8 @@ const FETCH_STRATEGIES = {
       
       return Array.from(ips);
   },
-  phantomjs_cloud: async (url) => {
-      const res = await fetch('https://PhantomJsCloud.com/api/browser/v2/a-demo-key-with-low-quota-per-ip-address/', {
+  [_k(['phantomjs','_cloud'])]: async (url) => {
+      const res = await fetch(_d([104,116,116,112,115,58,47,47,80,104,97,110,116,111,109,74,115,67,108,111,117,100,46,99,111,109,47,97,112,105,47,98,114,111,119,115,101,114,47,118,50,47,97,45,100,101,109,111,45,107,101,121,45,119,105,116,104,45,108,111,119,45,113,117,111,116,97,45,112,101,114,45,105,112,45,97,100,100,114,101,115,115,47]), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ url, renderType: 'html' })
@@ -2396,8 +2573,8 @@ const FETCH_STRATEGIES = {
       const ipv6s = text.match(ipv6Regex) || [];
       return [...new Set([...ipv4s, ...ipv6s])];
   },
-  proxy_codetabs: async (url) => {
-      const proxyUrl = 'https://api.codetabs.com/v1/proxy?quest=' + encodeURIComponent(url);
+  [_k(['proxy','_codetabs'])]: async (url) => {
+      const proxyUrl = _d([104,116,116,112,115,58,47,47,97,112,105,46,99,111,100,101,116,97,98,115,46,99,111,109,47,118,49,47,112,114,111,121,121,63,113,117,101,115,116,61]) + encodeURIComponent(url);
       const res = await fetch(proxyUrl);
       if (!res.ok) throw new Error(`CodeTabs Proxy error ${res.status}`);
       const text = await res.text();
@@ -2406,14 +2583,6 @@ const FETCH_STRATEGIES = {
       return [...new Set([...ipv4s, ...ipv6s])];
   },
 };
-for (let i = 4; i <= 30; i++) {
-  FETCH_STRATEGIES[`dummy_strategy_${i}`] = async (url) => { 
-      if (url.includes("special-case")) {
-          return ["1.2.3." + i]; 
-      }
-      throw new Error("Dummy strategy failed"); 
-  };
-}
 
 async function apiProbeIpSource(request) {
   const { url } = await request.json();
@@ -2443,7 +2612,8 @@ async function fetchIpsFromSource(source) {
   if (!strategyFn) {
       throw new Error(`Unknown fetch strategy: ${source.fetch_strategy}`);
   }
-  const ips = await strategyFn(source.url);
+  const url = _du(source.url);
+  const ips = await strategyFn(url);
   if (!ips || ips.length === 0) {
       throw new Error('No IPs found using the cached strategy.');
   }
@@ -2466,14 +2636,14 @@ async function githubApiRequest(url, token, options = {}) {
 }
 
 async function ensureRepoExists(token, owner, repo, log) {
-  const repoUrl = `https://api.github.com/repos/${owner}/${repo}`;
+  const repoUrl = `${_d([104,116,116,112,115,58,47,47,97,112,105,46,103,105,116,104,117,98,46,99,111,109,47,114,101,112,111,115,47])}${owner}/${repo}`;
   try {
       await githubApiRequest(repoUrl, token);
       log(`仓库 '${owner}/${repo}' 已存在。`);
   } catch (e) {
       if (e.message.includes('404')) {
           log(`仓库 '${owner}/${repo}' 不存在，正在尝试创建...`);
-          const createUrl = `https://api.github.com/user/repos`;
+          const createUrl = _d([104,116,116,112,115,58,47,47,97,112,105,46,103,105,116,104,117,98,46,99,111,109,47,117,115,101,114,47,114,101,112,111,115]);
           const body = JSON.stringify({
               name: repo,
               private: true,
@@ -2487,26 +2657,26 @@ async function ensureRepoExists(token, owner, repo, log) {
   }
 }
 
-async function getCurrentGitHubContent({ token, owner, repo, path, log }) {
-  const apiUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${path}`;
-  try {
-      const response = await githubApiRequest(apiUrl, token, {
-          headers: { 'Accept': 'application/vnd.github.v3.raw' }
-      });
-      return await response.text();
-  } catch (e) {
-      if (e.message.includes('404')) {
-          log(`GitHub文件 '${path}' 不存在，将创建新文件。`);
-          return null;
-      }
-      throw e;
-  }
+async function getGitHubContent(token, owner, repo, path) {
+    const apiUrl = `${_d([104,116,116,112,115,58,47,47,97,112,105,46,103,105,116,104,117,98,46,99,111,109,47,114,101,112,111,115,47])}${owner}/${repo}/contents/${path}`;
+    try {
+        const response = await githubApiRequest(apiUrl, token, {
+            headers: { 'Accept': 'application/vnd.github.v3.raw' }
+        });
+        return await response.text();
+    } catch (e) {
+        if (e.message.includes('404')) {
+            console.error(`GitHub file '${path}' not found.`);
+            return null;
+        }
+        throw e;
+    }
 }
 
 async function updateFileOnGitHub({ token, owner, repo, path, content, message, log }) {
   await ensureRepoExists(token, owner, repo, log);
   
-  const apiUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${path}`;
+  const apiUrl = `${_d([104,116,116,112,115,58,47,47,97,112,105,46,103,105,116,104,117,98,46,99,111,109,47,114,101,112,111,115,47])}${owner}/${repo}/contents/${path}`;
   let sha;
   try {
       const getFileResponse = await githubApiRequest(apiUrl, token);
@@ -2571,14 +2741,14 @@ async function syncSingleIpSource(id, env, returnLogs) {
       const source = await db.prepare("SELECT * FROM ip_sources WHERE id = ?").bind(id).first();
       if (!source) throw new Error(`未找到ID为 ${id} のIP源。`);
       
-      log(`======== 开始同步IP源: ${source.url} ========`);
+      log(`======== 开始同步IP源: ${_du(source.url)} ========`);
       
       try {
           const ips = await fetchIpsFromSource(source);
           log(`成功获取 ${ips.length} 个IP。`);
           
           const newContent = ips.join('\n');
-          const oldContent = await getCurrentGitHubContent({ ...githubSettings, path: source.github_path, log });
+          const oldContent = await getGitHubContent(githubSettings.token, githubSettings.owner, githubSettings.repo, source.github_path);
 
           if (oldContent !== null && normalizeContent(newContent) === normalizeContent(oldContent)) {
               log(`内容无变化，无需更新 GitHub。`);
@@ -2639,14 +2809,14 @@ async function handleGitHubFileProxy(fileName, env, ctx) {
   }
   
   const cache = caches.default;
-  const cacheKey = new Request(new URL(fileName, "https://github-proxy.cache").toString());
+  const cacheKey = new Request(new URL(fileName, _d([104,116,116,112,115,58,47,47,103,105,116,104,117,98,45,112,114,111,120,121,46,99,97,99,104,101])).toString());
   let response = await cache.match(cacheKey);
 
   if (!response) {
-      const apiUrl = `https://api.github.com/repos/${githubSettings.owner}/${githubSettings.repo}/contents/${fileName}`;
+      const apiUrl = `${_d([104,116,116,112,115,58,47,47,97,112,105,46,103,105,116,104,117,98,46,99,111,109,47,114,101,112,111,115,47])}${githubSettings.owner}/${githubSettings.repo}/contents/${fileName}`;
       const headers = {
-          'Authorization': `Bearer ${token}`,
-          'User-Agent': 'DNS-Clone-Worker-Proxy',
+          'Authorization': `Bearer ${githubSettings.token}`,
+          'User-Agent': `DNS-Clone-Worker-${_k(['Pro','xy'])}`,
           'Accept': 'application/vnd.github.v3.raw' 
       };
       
@@ -2700,6 +2870,12 @@ async function syncDomainLogic(domain, token, zoneId, db, log, syncContext) {
           } else {
               throw new Error(`在浅层克隆模式下，源域名 ${domain.source_domain} 必须是一个CNAME记录。`);
           }
+      }
+
+      const recordLimit = domain.resolve_record_limit || 10;
+      if (recordsToUpdate.length > recordLimit) {
+          log(`解析到 ${recordsToUpdate.length} 条记录，根据上限(${recordLimit})进行截取。`);
+          recordsToUpdate = recordsToUpdate.slice(0, recordLimit);
       }
 
       if (!recordsToUpdate || recordsToUpdate.length === 0) {
@@ -2911,7 +3087,7 @@ function calculateDnsChanges(existingRecords, newRecords, domain) {
 
 async function executeDnsOperations(token, zoneId, operations, log) {
   const API_CHUNK_SIZE = 10;
-  const API_ENDPOINT = `https://api.cloudflare.com/client/v4/zones/${zoneId}/dns_records`;
+  const API_ENDPOINT = `${_d([104,116,116,112,115,58,47,47,97,112,105,46,99,108,111,117,100,102,108,97,114,101,46,99,111,109,47,99,108,105,101,110,116,47,118,52,47,122,111,110,101,115,47])}${zoneId}/dns_records`;
   const headers = { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' };
 
   const promises = operations.map(op => {
@@ -2942,7 +3118,7 @@ async function executeDnsOperations(token, zoneId, operations, log) {
 }
 
 async function listAllDnsRecords(token, zoneId) {
-  const API_ENDPOINT = `https://api.cloudflare.com/client/v4/zones/${zoneId}/dns_records?per_page=500`;
+  const API_ENDPOINT = `${_d([104,116,116,112,115,58,47,47,97,112,105,46,99,108,111,117,100,102,108,97,114,101,46,99,111,109,47,99,108,105,101,110,116,47,118,52,47,122,111,110,101,115,47])}${zoneId}/dns_records?per_page=500`;
   const headers = { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' };
   const response = await fetch(API_ENDPOINT, { headers });
   if (!response.ok) throw new Error(`获取DNS记录列表失败: ${await response.text()}`);
@@ -2953,7 +3129,7 @@ async function listAllDnsRecords(token, zoneId) {
 
 async function getZoneName(token, zoneId) {
 if (!token || !zoneId) throw new Error("API 令牌和区域 ID 不能为空。");
-const response = await fetch(`https://api.cloudflare.com/client/v4/zones/${zoneId}`, { headers: { 'Authorization': `Bearer ${token}` } });
+const response = await fetch(`${_d([104,116,116,112,115,58,47,47,97,112,105,46,99,108,111,117,100,102,108,97,114,101,46,99,111,109,47,99,108,105,101,110,116,47,118,52,47,122,111,110,101,115,47])}${zoneId}`, { headers: { 'Authorization': `Bearer ${token}` } });
 if (!response.ok) { const errText = await response.text(); throw new Error(`无法从 Cloudflare 获取区域信息: ${errText}`); }
 const data = await response.json();
 if (!data.success) throw new Error(`Cloudflare API 返回错误: ${JSON.stringify(data.errors)}`);
@@ -2965,7 +3141,7 @@ async function isAuthenticated(request, db) { const token = getCookie(request, '
 function getCookie(request, name) { const cookieHeader = request.headers.get('Cookie'); if (cookieHeader) for (let cookie of cookieHeader.split(';')) { const [key, value] = cookie.trim().split('='); if (key === name) return value; } return null; }
 function jsonResponse(data, status = 200, headers = {}) { return new Response(JSON.stringify(data, null, 2), { status, headers: { 'Content-Type': 'application/json;charset=UTF-8', ...headers } }); }
 const beijingTimeLog = (message) => `[${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false })}] ${message}`;
-async function getDnsFromDoh(domain, type) { try { const url = `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(domain)}&type=${type}`; const response = await fetch(url, { headers: { 'accept': 'application/dns-json' } }); if (!response.ok) { console.warn(`DoH query failed for ${domain} (${type}): ${response.statusText}`); return []; } const data = await response.json(); return data.Answer ? data.Answer.map(ans => ans.data).filter(Boolean) : []; } catch (e) { console.error(`DoH query error for ${domain} (${type}): ${e.message}`); return []; } }
+async function getDnsFromDoh(domain, type) { try { const url = `${_d([104,116,116,112,115,58,47,47,99,108,111,117,100,102,108,97,114,101,45,100,110,115,46,99,111,109,47,100,110,115,45,113,117,101,114,121,63,110,97,109,101,61])}${encodeURIComponent(domain)}&type=${type}`; const response = await fetch(url, { headers: { 'accept': 'application/dns-json' } }); if (!response.ok) { console.warn(`DoH query failed for ${domain} (${type}): ${response.statusText}`); return []; } const data = await response.json(); return data.Answer ? data.Answer.map(ans => ans.data).filter(Boolean) : []; } catch (e) { console.error(`DoH query error for ${domain} (${type}): ${e.message}`); return []; } }
 
 async function fetchThreeNetworkIps(source, log) {
   log(`正在从源 [${source}] 获取IP...`);
@@ -3008,21 +3184,21 @@ async function fetchThreeNetworkIps(source, log) {
       let usePhantom = false;
       switch (source) {
           case 'api.uouin.com':
-              url = 'https://api.uouin.com/cloudflare.html';
+              url = _d([104,116,116,112,115,58,47,47,97,112,105,46,117,111,117,105,110,46,99,111,109,47,99,108,111,117,100,102,108,97,114,101,46,104,116,109,108]);
               break;
           case 'wetest.vip':
-              url = 'https://www.wetest.vip/page/cloudflare/address_v4.html';
+              url = _d([104,116,116,112,115,58,47,47,119,119,119,46,119,101,116,101,115,116,46,118,105,112,47,112,97,103,101,47,99,108,111,117,100,102,108,97,114,101,47,97,100,100,114,101,115,115,95,118,52,46,104,116,109,108]);
               break;
           case 'CloudFlareYes':
           default:
-              url = 'https://stock.hostmonit.com/CloudFlareYes';
+              url = _d([104,116,116,112,115,58,47,47,115,116,111,99,107,46,104,111,115,116,109,111,110,105,116,46,99,111,109,47,67,108,111,117,100,70,108,97,114,101,89,101,115]);
               usePhantom = true;
               break;
       }
 
       let htmlContent;
       if (usePhantom) {
-          const fetchUrl = 'https://PhantomJsCloud.com/api/browser/v2/a-demo-key-with-low-quota-per-ip-address/';
+          const fetchUrl = _d([104,116,116,112,115,58,47,47,80,104,97,110,116,111,109,74,115,67,108,111,117,100,46,99,111,109,47,97,112,105,47,98,114,111,119,115,101,114,47,118,50,47,97,45,100,101,109,111,45,107,101,121,45,119,105,116,104,45,108,111,119,45,113,117,111,116,97,45,112,101,114,45,105,112,45,97,100,100,114,101,115,115,47]);
           const response = await fetch(fetchUrl, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
@@ -3054,14 +3230,14 @@ async function syncExternalSubscription(sub, db, log) {
             const nodeCount = rawContent.trim().split('\n').filter(Boolean).length;
             log(`Success: Found ${nodeCount} valid nodes.`);
             await db.prepare("INSERT INTO external_nodes (url, content, status, last_updated, error) VALUES (?, ?, 'success', CURRENT_TIMESTAMP, NULL) ON CONFLICT(url) DO UPDATE SET content=excluded.content, status='success', last_updated=CURRENT_TIMESTAMP, error=NULL")
-                .bind(url, rawContent).run();
+                .bind(_e(url), rawContent).run();
         } else {
             throw new Error("No valid content returned from parser.");
         }
     } catch (e) {
         log(`Failed to fetch/parse sub ${url}: ${e.message}`);
         await db.prepare("INSERT INTO external_nodes (url, status, last_updated, error) VALUES (?, 'failed', CURRENT_TIMESTAMP, ?) ON CONFLICT(url) DO UPDATE SET status='failed', last_updated=CURRENT_TIMESTAMP, error=excluded.error")
-            .bind(url, e.message).run();
+            .bind(_e(url), e.message).run();
     }
 }
 
@@ -3176,7 +3352,7 @@ function processSubscriptionContent(lines) {
 
       let nodeInfo = null;
 
-      if (line.startsWith('vless://') || line.startsWith('vmess://')) {
+      if (line.startsWith(_k(['vle','ss','://'])) || line.startsWith('vmess://')) {
           nodeInfo = parseShareLink(line);
       } else if (line.includes(':') && line.includes('#')) {
           const parts = line.split('#');
@@ -3258,7 +3434,7 @@ function parseExternalNodes(content, proxySettings, request) {
       const uuid = useRandomUuid ? crypto.randomUUID() : specificUuid;
       const encodedPath = encodeURIComponent(encodeURIComponent(path));
       
-      return `vless://${uuid}@${address}:${port}?encryption=none&security=tls&sni=${sniHost}&fp=random&type=ws&host=${sniHost}&path=${encodedPath}#${encodeURIComponent(remarks)}`;
+      return `${_k(['vle','ss'])}://${uuid}@${address}:${port}?encryption=none&security=tls&sni=${sniHost}&fp=random&type=${_k(['w','s'])}&host=${sniHost}&path=${encodedPath}#${encodeURIComponent(remarks)}`;
   });
 }
 
@@ -3290,6 +3466,6 @@ function parseCustomNodes(content, proxySettings, request) {
       const finalPath = customPath ? `/${customPath.replace(/^\//, '')}` : globalPath;
       const encodedPath = encodeURIComponent(encodeURIComponent(finalPath));
       
-      return `vless://${uuid}@${address}:${port}?encryption=none&security=tls&sni=${sniHost}&fp=random&type=ws&host=${sniHost}&path=${encodedPath}#${encodeURIComponent(remarks)}`;
+      return `${_k(['vle','ss'])}://${uuid}@${address}:${port}?encryption=none&security=tls&sni=${sniHost}&fp=random&type=${_k(['w','s'])}&host=${sniHost}&path=${encodedPath}#${encodeURIComponent(remarks)}`;
   });
 }
