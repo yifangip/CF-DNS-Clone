@@ -2,7 +2,7 @@
 
 <div align="center">
 
-### 🙏 特别鸣谢
+### 🙏 特别鸣谢   CMliu 频道
 
 首先，特别感谢 **CMliu** 频道。本项目中使用的部分核心 `Snippets` 代码及 `ProxyIP` 均源自该频道。
 
