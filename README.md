@@ -24,7 +24,7 @@
 
 ---
 
-<iframe width="914" height="514" src="https://www.youtube.com/embed/a4Ky4kg1LhI" title="Cloudflare Snippets diy 玩法，自动优选，读取他人订阅优选，域名克隆，自动解析，同步采集优选网站内容上传到Github等等功能..." frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" referrerpolicy="strict-origin-when-cross-origin" allowfullscreen></iframe>
+[![点击观看视频](https://img.youtube.com/vi/a4Ky4kg1LhI/hqdefault.jpg)](https://www.youtube.com/watch?v=a4Ky4kg1LhI)
 
 ---
 
