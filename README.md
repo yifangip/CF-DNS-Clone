@@ -24,7 +24,15 @@
 
 ---
 
-[![点击观看视频](https://img.youtube.com/vi/a4Ky4kg1LhI/hqdefault.jpg)](https://www.youtube.com/watch?v=a4Ky4kg1LhI)
+<div align="center">
+  <a href="https://www.youtube.com/watch?v=a4Ky4kg1LhI" target="_blank">
+    <img src="https://img.shields.io/badge/YouTube-%23FF0000.svg?style=for-the-badge&logo=YouTube&logoColor=white" alt="YouTube Badge"/>
+  </a>
+  <br/>
+  <a href="https://www.youtube.com/watch?v=a4Ky4kg1LhI" target="_blank">
+    <img src="https://img.youtube.com/vi/a4Ky4kg1LhI/hqdefault.jpg" alt="点击观看视频">
+  </a>
+</div>
 
 ---
 
