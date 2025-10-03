@@ -24,6 +24,12 @@
 
 ---
 
+<iframe width="914" height="514" src="https://www.youtube.com/embed/a4Ky4kg1LhI" title="Cloudflare Snippets diy 玩法，自动优选，读取他人订阅优选，域名克隆，自动解析，同步采集优选网站内容上传到Github等等功能..." frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" referrerpolicy="strict-origin-when-cross-origin" allowfullscreen></iframe>
+
+---
+
+
+
 ## 🚀 项目是干嘛的？
 
 简单来说，这个项目能让你**直接克隆任何一个优选好的域名**（比如别人花时间筛选的 CDN 加速域名），并把它所有的 DNS 解析记录实时同步到**你自己的域名**上。
